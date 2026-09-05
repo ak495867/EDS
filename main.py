@@ -27,7 +27,7 @@ END = "2025-01-01"
 WINDOW = 20
 HORIZON = 5
 D_MODEL = 32
-BATCH_SIZE = 256
+BATCH_SIZE = 512
 EPOCHS = 30
 LR = 1e-3
 TRAIN_FRAC = 0.7
@@ -37,6 +37,9 @@ SEED = 42
 
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 def download_all(tickers, start, end):
     out = {}
@@ -224,26 +227,33 @@ def train_regressor(model, loader, epochs, lr, name):
     model.to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     mse = nn.MSELoss()
+    scaler = torch.cuda.amp.GradScaler()
     for ep in range(epochs):
         model.train()
         total = 0.0
         for X, y, r in loader:
             X, y = X.to(DEVICE), y.to(DEVICE)
             opt.zero_grad()
-            pred = model(X)
-            loss = mse(pred, y)
-            loss.backward()
-            opt.step()
+            with torch.cuda.amp.autocast():
+                pred = model(X)
+                loss = mse(pred, y)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             total += loss.item() * len(y)
         print(f"{name} epoch {ep+1}/{epochs} loss {total/len(loader.dataset):.6f}")
     return model
 
-@torch.no_grad()
+@torch.inference_mode()
 def predict_torch(model, X):
     model.eval()
-    Xt = torch.tensor(X, dtype=torch.float32).to(DEVICE)
-    pred = model(Xt)
-    return pred.cpu().numpy()
+    Xt = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+    preds = []
+    for i in range(0, len(Xt), BATCH_SIZE):
+        batch = Xt[i:i+BATCH_SIZE]
+        pred = model(batch)
+        preds.append(pred.cpu().numpy())
+    return np.concatenate(preds)
 
 def flatten_last(X):
     return X[:, -1, :]
@@ -324,7 +334,14 @@ def main():
     Xtr_s = apply_scaler(Xtr, scaler)
     Xte_s = apply_scaler(Xte, scaler)
 
-    train_loader = DataLoader(WindowDataset(Xtr_s, ytr, rtr), batch_size=BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(
+        WindowDataset(Xtr_s, ytr, rtr),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
+    )
 
     eds = SimplifiedEDS(in_dim=Xtr_s.shape[-1], d_model=D_MODEL)
     eds = train_regressor(eds, train_loader, EPOCHS, LR, "EDS")

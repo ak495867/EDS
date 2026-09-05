@@ -158,27 +158,44 @@ class EDSModelV2(nn.Module):
         impulse_seq, _ = self.impulse_rnn(x)
         z = torch.zeros(batch_size, self.latent_dim, device=x.device)
         v = torch.zeros(batch_size, self.latent_dim, device=x.device)
-        z_seq, v_seq, z_eq_out, acc_pred_seq = [], [], [], []
+        z_seq, v_seq, z_eq_out, delta_seq, impulse_list = [], [], [], [], []
         for t in range(seq_len):
             z_eq = z_eq_seq[:, t, :]
             delta = z - z_eq
-            V_vals = self.V(delta).squeeze(-1)
-            V_total = V_vals.sum()
-            grad_V = torch.autograd.grad(V_total, delta, create_graph=True)[0]
             vol = x[:, t, 6].unsqueeze(-1)
             beta = self.beta_net(vol)
             z_eq = z_eq + beta * delta
             impulse = impulse_seq[:, t, :]
-            acc = -self.gamma * v - grad_V + impulse
-            v = v + acc
-            z = z + v
+            # we will compute acc in loss using grad_V, so skip here
+            # update z and v using a placeholder acc (will be recomputed in loss)
+            # We'll just store necessary sequences and later compute acc in loss
+            # For now, we'll update with a zero acc to keep the graph? Actually we cannot update without acc.
+            # We'll update with a dummy that doesn't affect gradients, but we need the graph for z and v.
+            # Instead, we will not update z and v here; we will let the loss function handle dynamics.
+            # So we just store the sequences.
             z_seq.append(z)
             v_seq.append(v)
             z_eq_out.append(z_eq)
-            acc_pred_seq.append(acc)
+            delta_seq.append(delta)
+            impulse_list.append(impulse)
+            # Actually we need to compute the next state for the next time step.
+            # We'll compute acc using grad_V but we don't have grad_V here.
+            # So we'll compute grad_V in loss, but that would require re-running the loop.
+            # Better: we compute grad_V here with create_graph=True and then update.
+            # But to avoid the error, we can set delta.requires_grad_(True) and then compute grad_V.
+            # Let's do that: ensure delta requires grad.
+            delta.requires_grad_(True)
+            V_vals = self.V(delta).squeeze(-1)
+            V_total = V_vals.sum()
+            grad_V = torch.autograd.grad(V_total, delta, create_graph=True)[0]
+            acc = -self.gamma * v - grad_V + impulse
+            v = v + acc
+            z = z + v
         z_seq = torch.stack(z_seq, dim=1)
         v_seq = torch.stack(v_seq, dim=1)
         z_eq_seq = torch.stack(z_eq_out, dim=1)
+        delta_seq = torch.stack(delta_seq, dim=1)
+        impulse_seq = torch.stack(impulse_list, dim=1)
         final_z = z_seq[:, -1, :]
         final_v = v_seq[:, -1, :]
         final_eq = z_eq_seq[:, -1, :]
@@ -187,12 +204,30 @@ class EDSModelV2(nn.Module):
         feat = torch.cat([final_z, final_v, final_eq, V_final], dim=1)
         mu = self.mu_head(feat).squeeze(-1)
         logvar = self.logvar_head(feat).squeeze(-1)
-        return mu, logvar, z_seq, v_seq, z_eq_seq, torch.stack(acc_pred_seq, dim=1)
+        return mu, logvar, z_seq, v_seq, z_eq_seq, delta_seq, impulse_seq
 
-    def compute_loss(self, mu, logvar, target, z_seq, v_seq, z_eq_seq, acc_pred, lambda1=0.1, lambda2=0.01):
+    def compute_loss(self, mu, logvar, target, z_seq, v_seq, z_eq_seq, delta_seq, impulse_seq, lambda1=0.1, lambda2=0.01):
         pred_loss = 0.5 * (logvar + (target - mu)**2 / torch.exp(logvar)).mean()
+        # Compute dynamics loss: we need grad_V for each time step
+        # We'll compute grad_V for delta_seq[:, t] using autograd
+        seq_len = delta_seq.size(1)
+        acc_pred_list = []
+        for t in range(seq_len - 1):
+            delta_t = delta_seq[:, t, :]
+            # delta_t should already have requires_grad from forward? It should.
+            # But to be safe, we set requires_grad if not.
+            if not delta_t.requires_grad:
+                delta_t.requires_grad_(True)
+            V_vals = self.V(delta_t).squeeze(-1)
+            V_total = V_vals.sum()
+            grad_V = torch.autograd.grad(V_total, delta_t, create_graph=True)[0]
+            v_t = v_seq[:, t, :]
+            impulse_t = impulse_seq[:, t, :]
+            acc_pred = -self.gamma * v_t - grad_V + impulse_t
+            acc_pred_list.append(acc_pred)
+        acc_pred_seq = torch.stack(acc_pred_list, dim=1)
         acc_actual = v_seq[:, 1:, :] - v_seq[:, :-1, :]
-        dyn_loss = nn.functional.mse_loss(acc_actual, acc_pred[:, :-1, :])
+        dyn_loss = nn.functional.mse_loss(acc_actual, acc_pred_seq)
         stab_loss = nn.functional.mse_loss(z_eq_seq[:, 1:, :], z_eq_seq[:, :-1, :])
         return pred_loss + lambda1 * dyn_loss + lambda2 * stab_loss
 
@@ -228,8 +263,8 @@ def train_eds(model, train_loader, val_loader, epochs=20, lr=0.001):
         for Xb, yb in tqdm(train_loader, desc=f'EDS Epoch {epoch+1}/{epochs}'):
             Xb, yb = Xb.to(device), yb.to(device)
             optimizer.zero_grad()
-            mu, logvar, z_seq, v_seq, z_eq, acc_pred = model(Xb)
-            loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, acc_pred)
+            mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq = model(Xb)
+            loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq)
             loss.backward()
             optimizer.step()
         model.eval()
@@ -237,8 +272,8 @@ def train_eds(model, train_loader, val_loader, epochs=20, lr=0.001):
         with torch.no_grad():
             for Xb, yb in val_loader:
                 Xb, yb = Xb.to(device), yb.to(device)
-                mu, logvar, z_seq, v_seq, z_eq, acc_pred = model(Xb)
-                loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, acc_pred)
+                mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq = model(Xb)
+                loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq)
                 val_loss += loss.item()
         val_loss /= len(val_loader)
         if val_loss < best_loss:
@@ -294,16 +329,13 @@ def evaluate_model_batched(model, X_test, batch_size=4096):
     dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     preds = []
-    if hasattr(model, 'compute_loss'):
-        with torch.no_grad():
-            for Xb, in loader:
-                Xb = Xb.to(device)
-                mu, logvar, _, _, _, _ = model(Xb)
+    with torch.no_grad():
+        for Xb, in loader:
+            Xb = Xb.to(device)
+            if hasattr(model, 'mu_head'):  # EDS
+                mu, _, _, _, _, _, _ = model(Xb)
                 preds.append(mu.cpu().numpy())
-    else:
-        with torch.no_grad():
-            for Xb, in loader:
-                Xb = Xb.to(device)
+            else:
                 preds.append(model(Xb).cpu().numpy())
     return np.concatenate(preds)
 
@@ -315,7 +347,7 @@ def evaluate_model_variance(model, X_test, batch_size=4096):
     with torch.no_grad():
         for Xb, in loader:
             Xb = Xb.to(device)
-            mu, logvar, _, _, _, _ = model(Xb)
+            mu, logvar, _, _, _, _, _ = model(Xb)
             mus.append(mu.cpu().numpy())
             logvars.append(logvar.cpu().numpy())
     return np.concatenate(mus), np.exp(np.concatenate(logvars))
@@ -330,11 +362,8 @@ def compute_strategy_returns_kelly(mu, sigma2, actual, top=0.1, lambda_reg=1e-3,
     w[long_idx] = 1.0 / int(n*top)
     w[short_idx] = -1.0 / int(n*top)
     ret = w * actual
-    # transaction cost: assume full rebalance each period
-    # For simplicity, cost is applied per trade; we'll approximate by tc * |w_t - w_{t-1}| but we don't have history here
-    # In this cross-sectional setting, we assume rebalancing daily with full turnover; cost = tc * sum(|w|) (approx)
     cost = tc * np.sum(np.abs(w))
-    ret -= cost / n  # average cost per asset
+    ret -= cost / n
     return ret
 
 def main():
@@ -379,14 +408,14 @@ def main():
     for name, model in models.items():
         print(f"Training {name}...")
         train_dataset = TensorDataset(torch.tensor(X_train_scaled, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
-        train_loader = DataLoader(train_dataset, batch_size=2048, shuffle=True, pin_memory=True)
-        val_loader = DataLoader(train_dataset, batch_size=2048, shuffle=False, pin_memory=True)
+        train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True, pin_memory=True)
+        val_loader = DataLoader(train_dataset, batch_size=1024, shuffle=False, pin_memory=True)
         if name == 'EDS_V2':
-            model = train_eds(model, train_loader, val_loader, epochs=20, lr=0.001)
+            model = train_eds(model, train_loader, val_loader, epochs=15, lr=0.001)
         elif name == 'LSTM':
-            model = train_lstm(model, train_loader, val_loader, epochs=20, lr=0.001)
+            model = train_lstm(model, train_loader, val_loader, epochs=15, lr=0.001)
         else:
-            model = train_transformer(model, train_loader, val_loader, epochs=20, lr=0.001)
+            model = train_transformer(model, train_loader, val_loader, epochs=15, lr=0.001)
         trained[name] = model
 
     lr_model = LinearRegression()
@@ -398,8 +427,8 @@ def main():
     for name, model in trained.items():
         if name == 'EDS_V2':
             mu, var = evaluate_model_variance(model, X_test_scaled, batch_size=4096)
-            all_preds[name + '_mu'] = mu
-            all_preds[name + '_var'] = var
+            all_preds['EDS_V2_mu'] = mu
+            all_preds['EDS_V2_var'] = var
         else:
             all_preds[name] = evaluate_model_batched(model, X_test_scaled, batch_size=4096)
     all_preds['Linear'] = lr_model.predict(X_test_scaled.reshape(X_test_scaled.shape[0], -1))
@@ -417,7 +446,6 @@ def main():
             continue
         ret = compute_strategy_returns_kelly(preds, np.ones_like(preds)*0.01, y_test, top=0.1, lambda_reg=1e-3, tc=0.001)
         strat_ret[name] = ret
-    # EDS V2 uses mu and var
     if 'EDS_V2_mu' in all_preds and 'EDS_V2_var' in all_preds:
         mu = all_preds['EDS_V2_mu']
         var = all_preds['EDS_V2_var']

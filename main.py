@@ -156,8 +156,8 @@ class EDSModelV2(nn.Module):
         h = self.encoder(x)
         z_eq_seq, _ = self.gru_eq(h)
         impulse_seq, _ = self.impulse_rnn(x)
-        z = torch.zeros(batch_size, self.latent_dim, device=x.device)
-        v = torch.zeros(batch_size, self.latent_dim, device=x.device)
+        z = torch.zeros(batch_size, self.latent_dim, device=x.device, requires_grad=True)
+        v = torch.zeros(batch_size, self.latent_dim, device=x.device, requires_grad=True)
         z_seq, v_seq, z_eq_out, delta_seq, impulse_list = [], [], [], [], []
         for t in range(seq_len):
             z_eq = z_eq_seq[:, t, :]
@@ -166,31 +166,22 @@ class EDSModelV2(nn.Module):
             beta = self.beta_net(vol)
             z_eq = z_eq + beta * delta
             impulse = impulse_seq[:, t, :]
-            # we will compute acc in loss using grad_V, so skip here
-            # update z and v using a placeholder acc (will be recomputed in loss)
-            # We'll just store necessary sequences and later compute acc in loss
-            # For now, we'll update with a zero acc to keep the graph? Actually we cannot update without acc.
-            # We'll update with a dummy that doesn't affect gradients, but we need the graph for z and v.
-            # Instead, we will not update z and v here; we will let the loss function handle dynamics.
-            # So we just store the sequences.
+            # compute gradient of potential
+            if delta.requires_grad:
+                V_vals = self.V(delta).squeeze(-1)
+                V_total = V_vals.sum()
+                grad_V = torch.autograd.grad(V_total, delta, create_graph=True)[0]
+            else:
+                # fallback (should not happen)
+                grad_V = torch.zeros_like(delta)
+            acc = -self.gamma * v - grad_V + impulse
+            v = v + acc
+            z = z + v
             z_seq.append(z)
             v_seq.append(v)
             z_eq_out.append(z_eq)
             delta_seq.append(delta)
             impulse_list.append(impulse)
-            # Actually we need to compute the next state for the next time step.
-            # We'll compute acc using grad_V but we don't have grad_V here.
-            # So we'll compute grad_V in loss, but that would require re-running the loop.
-            # Better: we compute grad_V here with create_graph=True and then update.
-            # But to avoid the error, we can set delta.requires_grad_(True) and then compute grad_V.
-            # Let's do that: ensure delta requires grad.
-            delta.requires_grad_(True)
-            V_vals = self.V(delta).squeeze(-1)
-            V_total = V_vals.sum()
-            grad_V = torch.autograd.grad(V_total, delta, create_graph=True)[0]
-            acc = -self.gamma * v - grad_V + impulse
-            v = v + acc
-            z = z + v
         z_seq = torch.stack(z_seq, dim=1)
         v_seq = torch.stack(v_seq, dim=1)
         z_eq_seq = torch.stack(z_eq_out, dim=1)
@@ -208,14 +199,12 @@ class EDSModelV2(nn.Module):
 
     def compute_loss(self, mu, logvar, target, z_seq, v_seq, z_eq_seq, delta_seq, impulse_seq, lambda1=0.1, lambda2=0.01):
         pred_loss = 0.5 * (logvar + (target - mu)**2 / torch.exp(logvar)).mean()
-        # Compute dynamics loss: we need grad_V for each time step
-        # We'll compute grad_V for delta_seq[:, t] using autograd
-        seq_len = delta_seq.size(1)
+        # dynamics loss: we want actual acceleration to match predicted acceleration
+        acc_actual = v_seq[:, 1:, :] - v_seq[:, :-1, :]
+        # compute predicted acceleration from delta_seq (grad_V) and impulse_seq
         acc_pred_list = []
-        for t in range(seq_len - 1):
+        for t in range(delta_seq.size(1) - 1):
             delta_t = delta_seq[:, t, :]
-            # delta_t should already have requires_grad from forward? It should.
-            # But to be safe, we set requires_grad if not.
             if not delta_t.requires_grad:
                 delta_t.requires_grad_(True)
             V_vals = self.V(delta_t).squeeze(-1)
@@ -226,7 +215,6 @@ class EDSModelV2(nn.Module):
             acc_pred = -self.gamma * v_t - grad_V + impulse_t
             acc_pred_list.append(acc_pred)
         acc_pred_seq = torch.stack(acc_pred_list, dim=1)
-        acc_actual = v_seq[:, 1:, :] - v_seq[:, :-1, :]
         dyn_loss = nn.functional.mse_loss(acc_actual, acc_pred_seq)
         stab_loss = nn.functional.mse_loss(z_eq_seq[:, 1:, :], z_eq_seq[:, :-1, :])
         return pred_loss + lambda1 * dyn_loss + lambda2 * stab_loss
@@ -255,7 +243,7 @@ class TransformerModel(nn.Module):
         x = self.embed(x) + self.pos_enc[:, :seq_len, :]
         return self.fc(self.transformer(x)[:, -1, :]).squeeze(-1)
 
-def train_eds(model, train_loader, val_loader, epochs=20, lr=0.001):
+def train_eds(model, train_loader, val_loader, epochs=10, lr=0.001):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     best_loss = float('inf')
     for epoch in range(epochs):
@@ -280,7 +268,7 @@ def train_eds(model, train_loader, val_loader, epochs=20, lr=0.001):
             best_loss = val_loss
     return model
 
-def train_lstm(model, train_loader, val_loader, epochs=20, lr=0.001):
+def train_lstm(model, train_loader, val_loader, epochs=10, lr=0.001):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     best_loss = float('inf')
     for epoch in range(epochs):
@@ -302,7 +290,7 @@ def train_lstm(model, train_loader, val_loader, epochs=20, lr=0.001):
             best_loss = val_loss
     return model
 
-def train_transformer(model, train_loader, val_loader, epochs=20, lr=0.001):
+def train_transformer(model, train_loader, val_loader, epochs=10, lr=0.001):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     best_loss = float('inf')
     for epoch in range(epochs):
@@ -332,7 +320,7 @@ def evaluate_model_batched(model, X_test, batch_size=4096):
     with torch.no_grad():
         for Xb, in loader:
             Xb = Xb.to(device)
-            if hasattr(model, 'mu_head'):  # EDS
+            if hasattr(model, 'mu_head'):
                 mu, _, _, _, _, _, _ = model(Xb)
                 preds.append(mu.cpu().numpy())
             else:
@@ -411,11 +399,11 @@ def main():
         train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True, pin_memory=True)
         val_loader = DataLoader(train_dataset, batch_size=1024, shuffle=False, pin_memory=True)
         if name == 'EDS_V2':
-            model = train_eds(model, train_loader, val_loader, epochs=15, lr=0.001)
+            model = train_eds(model, train_loader, val_loader, epochs=10, lr=0.001)
         elif name == 'LSTM':
-            model = train_lstm(model, train_loader, val_loader, epochs=15, lr=0.001)
+            model = train_lstm(model, train_loader, val_loader, epochs=10, lr=0.001)
         else:
-            model = train_transformer(model, train_loader, val_loader, epochs=15, lr=0.001)
+            model = train_transformer(model, train_loader, val_loader, epochs=10, lr=0.001)
         trained[name] = model
 
     lr_model = LinearRegression()

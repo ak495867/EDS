@@ -20,8 +20,10 @@ warnings.filterwarnings('ignore')
 torch.manual_seed(42)
 np.random.seed(42)
 
-def get_tickers(n=500):
+def get_tickers(n=200):
+    """Get a list of tickers, using a reliable source or fallback."""
     tickers = []
+    # Try to fetch S&P 500 from a static CSV
     try:
         url = 'https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv'
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -32,51 +34,73 @@ def get_tickers(n=500):
             tickers = [t.replace('.', '-') for t in tickers]
     except:
         pass
-    if len(tickers) < 100:
+    # If failed or too few, use a well-known list of major stocks and ETFs
+    if len(tickers) < 50:
         fallback = [
             'AAPL','MSFT','GOOGL','AMZN','NVDA','META','BRK-B','JPM','V','PG','JNJ','UNH','HD','MA','DIS',
             'BAC','NFLX','ADBE','CRM','CSCO','PFE','TMO','ACN','ABT','NKE','LIN','CVX','WMT','MCD','TXN',
-            'AMD','INTC','QCOM','IBM','GE','CAT','GS','MS','C','WFC','AXP','GS','BLK','LMT','MMM','HON',
-            'UNP','UPS','BA','FDX','RTX','LRCX','MU','PLD','AMT','CCI','EOG','PXD','COP','SLB','OXY',
-            'XOM','CVX','BP','TOT','RDS-A','CHE','CL','KO','PEP','MDLZ','GIS','KHC','HSY','MCD','SBUX',
-            'DPZ','YUM','CMG','DRI','MGM','LVS','WYNN','MAR','HLT','HST','RCL','CCL','NCLH','AAL','DAL',
-            'LUV','UAL','SAVE','JETS','T','VZ','TMUS','CHTR','CMCSA','FOXA','NWS','VIAC','DISCA','WBD',
-            'AMC','GME','BBY','HD','LOW','TJX','ROST','BURL','KSS','M','JWN','URBN','ANF','GPS','LB',
-            'PVH','RL','VFC','LEVI','COTY','ELF','CND','BIG','CHS','RAD','WBA','CVS','ABC','CAH','MCK',
-            'HUM','UNH','ANTM','CI','CNC','MOH','WCG','AET','HCIA','BHC','RIG','NOV','FTI','HAL','SLB',
-            'BHI','CHK','APA','DVN','FANG','MRO','PXD','XEC','NFX','CVE','IMO','SU','CNQ','MEG','TOU',
-            'WCP','ARX','VET','BTE','GTE','PBR','REP','ENI','SN','TTE','BP','RDS-A','CVX','XOM'
+            'AMD','INTC','QCOM','IBM','GE','CAT','GS','MS','C','WFC','AXP','BLK','LMT','MMM','HON','UNP',
+            'UPS','BA','FDX','RTX','LRCX','MU','PLD','AMT','CCI','EOG','COP','SLB','XOM','CVX','BP',
+            'CL','KO','PEP','MDLZ','GIS','KHC','HSY','MCD','SBUX','DPZ','YUM','CMG','DRI','MGM','LVS',
+            'WYNN','MAR','HLT','HST','RCL','CCL','NCLH','AAL','DAL','LUV','UAL','T','VZ','TMUS','CHTR',
+            'CMCSA','FOXA','NWS','WBD','AMC','GME','BBY','HD','LOW','TJX','ROST','BURL','KSS','M',
+            'PVH','RL','VFC','LEVI','COTY','ELF','CVS','WBA','HUM','UNH','CI','CNC','MOH','BHC','RIG',
+            'NOV','FTI','HAL','SLB','APA','DVN','FANG','MRO','CVE','IMO','SU','CNQ','PBR','REP','ENI',
+            'SN','TTE','BP','RDS-A'
         ]
-        tickers = fallback[:n]
-    extra = ['SPY','QQQ','IWM','DIA','TLT','GLD','SLV','USO','EFA','EEM','GC=F','CL=F','SI=F','HG=F','NG=F','IEF','SHY','LQD','HYG']
+        tickers = fallback
+    # Add common ETFs and commodities
+    extra = ['SPY','QQQ','IWM','DIA','TLT','GLD','SLV','USO','EFA','EEM']
+    # Some futures symbols might cause issues; we'll skip them or use their ETF equivalents
+    # Instead of GC=F, CL=F, we can use GLD, USO etc. but we already have them.
     tickers = list(dict.fromkeys(tickers + extra))
     return tickers[:n]
 
 def compute_features_and_target_for_asset(df, horizon=5, seq_len=20):
+    """Compute features and target, handling infinities and NaNs."""
     df = df.copy()
+    # Price-based returns
     df['ret'] = df['Close'].pct_change()
     df['log_ret'] = np.log(df['Close'] / df['Close'].shift(1))
     df['volume_change'] = df['Volume'].pct_change()
     df['high_low'] = (df['High'] - df['Low']) / df['Close']
     df['close_open'] = (df['Close'] - df['Open']) / df['Open']
+    
+    # RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
+    
     df['volatility'] = df['ret'].rolling(20).std()
     df['ret_5'] = df['Close'].pct_change(5)
     df['ret_10'] = df['Close'].pct_change(10)
     df['target'] = df['Close'].shift(-horizon) / df['Close'] - 1.0
+    
     feature_cols = ['ret','log_ret','volume_change','high_low','close_open','rsi','volatility','ret_5','ret_10']
-    df = df.dropna()
+    df = df.dropna()  # Drop rows with any NaN
+    
+    # Replace infinities with NaN and drop again
+    df = df.replace([np.inf, -np.inf], np.nan).dropna()
+    if df.empty:
+        return None, None, None
+    # Clip extreme values to prevent overflow
+    for col in feature_cols:
+        df[col] = np.clip(df[col], -1e6, 1e6)
     return df[feature_cols].values, df['target'].values, df.index
 
 def create_sequences(features, targets, seq_len, horizon):
     X, y = [], []
     for i in range(seq_len, len(features) - horizon):
-        X.append(features[i-seq_len:i])
+        seq = features[i-seq_len:i]
+        # Check for any non-finite values in the sequence
+        if np.any(~np.isfinite(seq)):
+            continue
+        X.append(seq)
         y.append(targets[i])
+    if not X:
+        return np.array([]), np.array([])
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
 def load_or_download_data(tickers, start='2010-01-01', end='2023-12-31', cache_dir='data_cache'):
@@ -88,7 +112,7 @@ def load_or_download_data(tickers, start='2010-01-01', end='2023-12-31', cache_d
     data = {}
     for ticker in tickers:
         try:
-            df = yf.download(ticker, start=start, end=end, progress=False, timeout=10)
+            df = yf.download(ticker, start=start, end=end, progress=False, timeout=15)
             if len(df) > 500:
                 data[ticker] = df
         except:
@@ -100,7 +124,10 @@ def load_or_download_data(tickers, start='2010-01-01', end='2023-12-31', cache_d
 def prepare_panel_data(asset_data, horizon=5, seq_len=20):
     all_X, all_y, all_dates, all_tickers = [], [], [], []
     for ticker, df in asset_data.items():
-        features, targets, dates = compute_features_and_target_for_asset(df, horizon, seq_len)
+        result = compute_features_and_target_for_asset(df, horizon, seq_len)
+        if result[0] is None:
+            continue
+        features, targets, dates = result
         if len(targets) > seq_len:
             X_seq, y_seq = create_sequences(features, targets, seq_len, horizon)
             if len(y_seq) > 0:
@@ -110,10 +137,16 @@ def prepare_panel_data(asset_data, horizon=5, seq_len=20):
                 all_tickers.append([ticker]*len(y_seq))
     if not all_X:
         return None, None, None, None
-    return (np.concatenate(all_X, axis=0),
-            np.concatenate(all_y, axis=0),
-            np.concatenate(all_dates),
-            np.concatenate(all_tickers))
+    # Concatenate and ensure no NaN/Inf
+    X_all = np.concatenate(all_X, axis=0)
+    y_all = np.concatenate(all_y, axis=0)
+    # Final check for non-finite values
+    mask = np.all(np.isfinite(X_all.reshape(X_all.shape[0], -1)), axis=1) & np.isfinite(y_all)
+    X_all = X_all[mask]
+    y_all = y_all[mask]
+    dates_all = np.concatenate(all_dates)[mask]
+    tickers_all = np.concatenate(all_tickers)[mask]
+    return X_all, y_all, dates_all, tickers_all
 
 class EDSModel(nn.Module):
     def __init__(self, input_dim, latent_dim=16, seq_len=20, horizon=5, lambda_restore=0.5):
@@ -272,19 +305,22 @@ def compute_strategy_returns(preds, actual, top=0.1):
 
 def main():
     tickers = get_tickers(200)
+    print(f"Attempting to load data for {len(tickers)} tickers")
     asset_data = load_or_download_data(tickers)
-    print(f"Loaded {len(asset_data)} assets")
+    print(f"Successfully loaded {len(asset_data)} assets")
     X_all, y_all, dates_all, tickers_all = prepare_panel_data(asset_data, horizon=5, seq_len=20)
     if X_all is None:
-        print("No data available.")
+        print("No data available after preprocessing.")
         return
 
+    print(f"Total samples: {len(X_all)}")
     date_series = pd.to_datetime(dates_all)
     unique_dates = np.sort(np.unique(date_series))
+    # Use a time-based split
     train_dates = unique_dates[unique_dates < pd.Timestamp('2018-01-01')]
     test_dates = unique_dates[(unique_dates >= pd.Timestamp('2018-01-01')) & (unique_dates < pd.Timestamp('2021-01-01'))]
     if len(train_dates) == 0 or len(test_dates) == 0:
-        print("Insufficient date range.")
+        print("Insufficient date range for split.")
         return
 
     train_mask = np.isin(date_series, train_dates)
@@ -293,14 +329,20 @@ def main():
     y_train = y_all[train_mask]
     X_test = X_all[test_mask]
     y_test = y_all[test_mask]
+    print(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
 
+    # Scale features
     scaler = StandardScaler()
     X_train_flat = X_train.reshape(-1, X_train.shape[-1])
+    # Check for non-finite before scaling
+    if np.any(~np.isfinite(X_train_flat)):
+        raise ValueError("Non-finite values found in training data after preprocessing.")
     scaler.fit(X_train_flat)
     X_train_scaled = scaler.transform(X_train_flat).reshape(X_train.shape)
     X_test_flat = X_test.reshape(-1, X_test.shape[-1])
     X_test_scaled = scaler.transform(X_test_flat).reshape(X_test.shape)
 
+    # Models
     models = {
         'EDS': EDSModel(input_dim=X_train.shape[-1], latent_dim=16, seq_len=20, horizon=5),
         'LSTM': LSTMModel(input_dim=X_train.shape[-1]),
@@ -320,9 +362,10 @@ def main():
             model = train_transformer(model, train_loader, val_loader)
         trained[name] = model
 
+    # Linear and XGBoost
     lr_model = LinearRegression()
     lr_model.fit(X_train_scaled.reshape(X_train_scaled.shape[0], -1), y_train)
-    xgb_model = xgb.XGBRegressor(n_estimators=100, max_depth=5)
+    xgb_model = xgb.XGBRegressor(n_estimators=100, max_depth=5, random_state=42)
     xgb_model.fit(X_train_scaled.reshape(X_train_scaled.shape[0], -1), y_train)
 
     all_preds = {}

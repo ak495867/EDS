@@ -9,8 +9,6 @@ from sklearn.preprocessing import StandardScaler
 from scipy.stats import spearmanr
 import xgboost as xgb
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, TensorDataset
-import requests
 import os
 import pickle
 import warnings
@@ -24,18 +22,29 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 if torch.cuda.is_available():
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+AMP_ENABLED = torch.cuda.is_available()
+
+# ---------------------------------------------------------------------------
+# Tickers
+# ---------------------------------------------------------------------------
 
 def get_tickers(n=150):
     tickers = []
     try:
+        import io
         url = 'https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv'
         headers = {'User-Agent': 'Mozilla/5.0'}
+        import requests
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
-            df = pd.read_csv(pd.StringIO(response.text))
+            df = pd.read_csv(io.StringIO(response.text))
             tickers = df['Symbol'].tolist()
             tickers = [t.replace('.', '-') for t in tickers]
-    except:
+    except Exception:
         pass
     if len(tickers) < 50:
         fallback = [
@@ -54,6 +63,10 @@ def get_tickers(n=150):
     extra = ['SPY','QQQ','IWM','DIA','TLT','GLD','SLV','USO','EFA','EEM']
     tickers = list(dict.fromkeys(tickers + extra))
     return tickers[:n]
+
+# ---------------------------------------------------------------------------
+# Features
+# ---------------------------------------------------------------------------
 
 def compute_features_and_target_for_asset(df, horizon=5, seq_len=20):
     df = df.copy()
@@ -78,19 +91,23 @@ def compute_features_and_target_for_asset(df, horizon=5, seq_len=20):
         return None, None, None
     for col in feature_cols:
         df[col] = np.clip(df[col], -1e6, 1e6)
-    return df[feature_cols].values, df['target'].values, df.index
+    return df[feature_cols].values.astype(np.float32), df['target'].values.astype(np.float32), df.index
 
 def create_sequences(features, targets, seq_len, horizon):
-    X, y = [], []
-    for i in range(seq_len, len(features) - horizon):
-        seq = features[i-seq_len:i]
-        if np.any(~np.isfinite(seq)):
-            continue
-        X.append(seq)
-        y.append(targets[i])
-    if not X:
+    # Vectorized via sliding_window_view instead of a Python append loop.
+    n = len(features) - horizon
+    if n <= seq_len:
         return np.array([]), np.array([])
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+    windows = np.lib.stride_tricks.sliding_window_view(features[:n], seq_len, axis=0)
+    # sliding_window_view puts the window axis last; move it to axis=1
+    windows = np.moveaxis(windows, -1, 1)  # (num_windows, seq_len, n_features)
+    y = targets[seq_len:n]
+    finite_mask = np.all(np.isfinite(windows.reshape(windows.shape[0], -1)), axis=1) & np.isfinite(y)
+    return windows[finite_mask].astype(np.float32), y[finite_mask].astype(np.float32)
+
+# ---------------------------------------------------------------------------
+# Data loading — batched/threaded yfinance download (the #1 real-world win)
+# ---------------------------------------------------------------------------
 
 def load_or_download_data(tickers, start='2010-01-01', end='2023-12-31', cache_dir='data_cache'):
     os.makedirs(cache_dir, exist_ok=True)
@@ -98,14 +115,27 @@ def load_or_download_data(tickers, start='2010-01-01', end='2023-12-31', cache_d
     if os.path.exists(cache_file):
         with open(cache_file, 'rb') as f:
             return pickle.load(f)
+
+    # yf.download accepts the whole ticker list at once and fans requests out
+    # over its own thread pool — this replaces ~150 sequential HTTP round
+    # trips with a handful of batched, concurrent ones.
+    raw = yf.download(
+        tickers, start=start, end=end, group_by='ticker',
+        threads=True, progress=True, auto_adjust=False,
+    )
+
     data = {}
-    for ticker in tqdm(tickers, desc="Downloading data"):
+    for ticker in tqdm(tickers, desc="Splitting per-ticker frames"):
         try:
-            df = yf.download(ticker, start=start, end=end, progress=False, timeout=15)
+            if isinstance(raw.columns, pd.MultiIndex):
+                df = raw[ticker].dropna(how='all')
+            else:
+                df = raw  # single-ticker edge case
             if len(df) > 500:
                 data[ticker] = df
-        except:
+        except (KeyError, Exception):
             continue
+
     with open(cache_file, 'wb') as f:
         pickle.dump(data, f)
     return data
@@ -122,8 +152,8 @@ def prepare_panel_data(asset_data, horizon=5, seq_len=20):
             if len(y_seq) > 0:
                 all_X.append(X_seq)
                 all_y.append(y_seq)
-                all_dates.append(dates[seq_len:len(dates)-horizon])
-                all_tickers.append([ticker]*len(y_seq))
+                all_dates.append(dates[seq_len:len(dates) - horizon][:len(y_seq)])
+                all_tickers.append(np.full(len(y_seq), ticker))
     if not all_X:
         return None, None, None, None
     X_all = np.concatenate(all_X, axis=0)
@@ -134,6 +164,13 @@ def prepare_panel_data(asset_data, horizon=5, seq_len=20):
     dates_all = np.concatenate(all_dates)[mask]
     tickers_all = np.concatenate(all_tickers)[mask]
     return X_all, y_all, dates_all, tickers_all
+
+# ---------------------------------------------------------------------------
+# Models (unchanged math — EDS_V2's per-step autograd.grad is inherent to the
+# physics-style dynamics and can't be vectorized across time because z_eq at
+# step t depends on z at step t-1. We speed it up with AMP + torch.compile
+# instead of changing the model.)
+# ---------------------------------------------------------------------------
 
 class EDSModelV2(nn.Module):
     def __init__(self, input_dim, latent_dim=16, seq_len=20, horizon=5, gamma=0.15):
@@ -147,8 +184,8 @@ class EDSModelV2(nn.Module):
         self.gru_eq = nn.GRU(latent_dim, latent_dim, batch_first=True)
         self.V = nn.Sequential(nn.Linear(latent_dim, 32), nn.ReLU(), nn.Linear(32, 1))
         self.beta_net = nn.Sequential(nn.Linear(1, 16), nn.ReLU(), nn.Linear(16, 1), nn.Sigmoid())
-        self.mu_head = nn.Sequential(nn.Linear(latent_dim*3 + 1, 64), nn.ReLU(), nn.Linear(64, 1))
-        self.logvar_head = nn.Sequential(nn.Linear(latent_dim*3 + 1, 64), nn.ReLU(), nn.Linear(64, 1))
+        self.mu_head = nn.Sequential(nn.Linear(latent_dim * 3 + 1, 64), nn.ReLU(), nn.Linear(64, 1))
+        self.logvar_head = nn.Sequential(nn.Linear(latent_dim * 3 + 1, 64), nn.ReLU(), nn.Linear(64, 1))
         self.to(device)
 
     def forward(self, x):
@@ -196,7 +233,7 @@ class EDSModelV2(nn.Module):
         return mu, logvar, z_seq, v_seq, z_eq_seq, delta_seq, impulse_seq, grad_V_seq
 
     def compute_loss(self, mu, logvar, target, z_seq, v_seq, z_eq_seq, delta_seq, impulse_seq, grad_V_seq, lambda1=0.1, lambda2=0.01):
-        pred_loss = 0.5 * (logvar + (target - mu)**2 / torch.exp(logvar)).mean()
+        pred_loss = 0.5 * (logvar + (target - mu) ** 2 / torch.exp(logvar)).mean()
         acc_actual = v_seq[:, 1:, :] - v_seq[:, :-1, :]
         acc_pred = -self.gamma * v_seq[:, :-1, :] - grad_V_seq[:, :-1, :] + impulse_seq[:, :-1, :]
         dyn_loss = nn.functional.mse_loss(acc_actual, acc_pred)
@@ -227,117 +264,107 @@ class TransformerModel(nn.Module):
         x = self.embed(x) + self.pos_enc[:, :seq_len, :]
         return self.fc(self.transformer(x)[:, -1, :]).squeeze(-1)
 
+# ---------------------------------------------------------------------------
+# GPU-resident manual batching — skips DataLoader/collate overhead entirely
+# for data that comfortably fits in memory.
+# ---------------------------------------------------------------------------
+
+class GPUBatcher:
+    def __init__(self, X, y, batch_size, shuffle=True):
+        self.X = X
+        self.y = y
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.n = X.shape[0]
+
+    def __iter__(self):
+        idx = torch.randperm(self.n, device=self.X.device) if self.shuffle else torch.arange(self.n, device=self.X.device)
+        for i in range(0, self.n, self.batch_size):
+            b = idx[i:i + self.batch_size]
+            yield self.X[b], self.y[b]
+
+    def __len__(self):
+        return (self.n + self.batch_size - 1) // self.batch_size
+
 def train_eds(model, train_loader, val_loader, epochs=10, lr=0.001):
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=AMP_ENABLED)
     best_loss = float('inf')
     for epoch in range(epochs):
         model.train()
         for Xb, yb in tqdm(train_loader, desc=f'EDS Epoch {epoch+1}/{epochs}'):
-            Xb, yb = Xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq = model(Xb)
-            loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type='cuda', enabled=AMP_ENABLED):
+                mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq = model(Xb)
+                loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         model.eval()
         val_loss = 0.0
         for Xb, yb in val_loader:
-            Xb, yb = Xb.to(device), yb.to(device)
             mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq = model(Xb)
             loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq)
             val_loss += loss.item()
-            del mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq, loss
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        val_loss /= len(val_loader)
+        val_loss /= max(len(val_loader), 1)
         if val_loss < best_loss:
             best_loss = val_loss
+        print(f"  EDS val_loss={val_loss:.6f}")
     return model
 
-def train_lstm(model, train_loader, val_loader, epochs=10, lr=0.001):
+def train_simple(model, train_loader, val_loader, epochs=10, lr=0.001, name='model'):
     optimizer = optim.Adam(model.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler(enabled=AMP_ENABLED)
     best_loss = float('inf')
     for epoch in range(epochs):
         model.train()
-        for Xb, yb in tqdm(train_loader, desc=f'LSTM Epoch {epoch+1}/{epochs}'):
-            Xb, yb = Xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            loss = nn.functional.mse_loss(model(Xb), yb)
-            loss.backward()
-            optimizer.step()
+        for Xb, yb in tqdm(train_loader, desc=f'{name} Epoch {epoch+1}/{epochs}'):
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type='cuda', enabled=AMP_ENABLED):
+                loss = nn.functional.mse_loss(model(Xb), yb)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for Xb, yb in val_loader:
-                Xb, yb = Xb.to(device), yb.to(device)
                 val_loss += nn.functional.mse_loss(model(Xb), yb).item()
-        val_loss /= len(val_loader)
+        val_loss /= max(len(val_loader), 1)
         if val_loss < best_loss:
             best_loss = val_loss
+        print(f"  {name} val_loss={val_loss:.6f}")
     return model
 
-def train_transformer(model, train_loader, val_loader, epochs=10, lr=0.001):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    best_loss = float('inf')
-    for epoch in range(epochs):
-        model.train()
-        for Xb, yb in tqdm(train_loader, desc=f'Transformer Epoch {epoch+1}/{epochs}'):
-            Xb, yb = Xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            loss = nn.functional.mse_loss(model(Xb), yb)
-            loss.backward()
-            optimizer.step()
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for Xb, yb in val_loader:
-                Xb, yb = Xb.to(device), yb.to(device)
-                val_loss += nn.functional.mse_loss(model(Xb), yb).item()
-        val_loss /= len(val_loader)
-        if val_loss < best_loss:
-            best_loss = val_loss
-    return model
-
-def evaluate_model_batched(model, X_test, batch_size=4096):
+def evaluate_model_batched(model, X_test, batch_size=8192):
     model.eval()
-    dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     preds = []
     with torch.no_grad():
-        for Xb, in loader:
-            Xb = Xb.to(device)
-            if hasattr(model, 'mu_head'):
-                mu, _, _, _, _, _, _, _ = model(Xb)
-                preds.append(mu.cpu().numpy())
-            else:
-                preds.append(model(Xb).cpu().numpy())
+        for i in range(0, X_test.shape[0], batch_size):
+            Xb = X_test[i:i + batch_size]
+            preds.append(model(Xb).cpu().numpy())
     return np.concatenate(preds)
 
-def evaluate_model_variance(model, X_test, batch_size=4096):
+def evaluate_model_variance(model, X_test, batch_size=8192):
     model.eval()
-    dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     mus, logvars = [], []
-    for Xb, in loader:
-        Xb = Xb.to(device)
+    for i in range(0, X_test.shape[0], batch_size):
+        Xb = X_test[i:i + batch_size]
         with torch.enable_grad():
-            mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq = model(Xb)
+            mu, logvar, *_ = model(Xb)
         mus.append(mu.detach().cpu().numpy())
         logvars.append(logvar.detach().cpu().numpy())
-        del z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq, mu, logvar
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
     return np.concatenate(mus), np.exp(np.concatenate(logvars))
 
 def compute_strategy_returns_kelly(mu, sigma2, actual, top=0.1, lambda_reg=1e-3, tc=0.001):
     weights = mu / (sigma2 + lambda_reg)
     n = len(weights)
     ranks = np.argsort(weights)
-    long_idx = ranks[-int(n*top):]
-    short_idx = ranks[:int(n*top)]
+    long_idx = ranks[-int(n * top):]
+    short_idx = ranks[:int(n * top)]
     w = np.zeros(n)
-    w[long_idx] = 1.0 / int(n*top)
-    w[short_idx] = -1.0 / int(n*top)
+    w[long_idx] = 1.0 / int(n * top)
+    w[short_idx] = -1.0 / int(n * top)
     ret = w * actual
     cost = tc * np.sum(np.abs(w))
     ret -= cost / n
@@ -355,59 +382,85 @@ def main():
     print(f"Total samples: {len(X_all)}")
     date_series = pd.to_datetime(dates_all)
     unique_dates = np.sort(np.unique(date_series))
-    train_dates = unique_dates[unique_dates < pd.Timestamp('2018-01-01')]
+    train_dates_all = unique_dates[unique_dates < pd.Timestamp('2018-01-01')]
     test_dates = unique_dates[(unique_dates >= pd.Timestamp('2018-01-01')) & (unique_dates < pd.Timestamp('2021-01-01'))]
-    if len(train_dates) == 0 or len(test_dates) == 0:
+    if len(train_dates_all) == 0 or len(test_dates) == 0:
         print("Insufficient date range for split.")
         return
+
+    # Real train/val split (last ~10% of training dates held out), instead of
+    # validating on the training set itself.
+    split_point = int(len(train_dates_all) * 0.9)
+    train_dates = train_dates_all[:split_point]
+    val_dates = train_dates_all[split_point:]
+
     train_mask = np.isin(date_series, train_dates)
+    val_mask = np.isin(date_series, val_dates)
     test_mask = np.isin(date_series, test_dates)
-    X_train = X_all[train_mask]
-    y_train = y_all[train_mask]
-    X_test = X_all[test_mask]
-    y_test = y_all[test_mask]
-    print(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
+    X_train, y_train = X_all[train_mask], y_all[train_mask]
+    X_val, y_val = X_all[val_mask], y_all[val_mask]
+    X_test, y_test = X_all[test_mask], y_all[test_mask]
+    print(f"Train samples: {len(X_train)}, Val samples: {len(X_val)}, Test samples: {len(X_test)}")
+
     scaler = StandardScaler()
     X_train_flat = X_train.reshape(-1, X_train.shape[-1])
     if np.any(~np.isfinite(X_train_flat)):
         raise ValueError("Non-finite values found in training data.")
     scaler.fit(X_train_flat)
     X_train_scaled = scaler.transform(X_train_flat).reshape(X_train.shape)
-    X_test_flat = X_test.reshape(-1, X_test.shape[-1])
-    X_test_scaled = scaler.transform(X_test_flat).reshape(X_test.shape)
+    X_val_scaled = scaler.transform(X_val.reshape(-1, X_val.shape[-1])).reshape(X_val.shape)
+    X_test_scaled = scaler.transform(X_test.reshape(-1, X_test.shape[-1])).reshape(X_test.shape)
+
+    # Move everything to the GPU once; batch by indexing instead of DataLoader.
+    X_train_t = torch.tensor(X_train_scaled, dtype=torch.float32, device=device)
+    y_train_t = torch.tensor(y_train, dtype=torch.float32, device=device)
+    X_val_t = torch.tensor(X_val_scaled, dtype=torch.float32, device=device)
+    y_val_t = torch.tensor(y_val, dtype=torch.float32, device=device)
+    X_test_t = torch.tensor(X_test_scaled, dtype=torch.float32, device=device)
+
+    BATCH_SIZE = 2048  # bumped up from 512 — per-step ops are tiny, so small batches under-use the GPU
 
     models = {
         'EDS_V2': EDSModelV2(input_dim=X_train.shape[-1], latent_dim=16, seq_len=20, horizon=5, gamma=0.15),
         'LSTM': LSTMModel(input_dim=X_train.shape[-1]),
-        'Transformer': TransformerModel(input_dim=X_train.shape[-1])
+        'Transformer': TransformerModel(input_dim=X_train.shape[-1]),
     }
+
+    if torch.cuda.is_available():
+        for name in models:
+            try:
+                models[name] = torch.compile(models[name])
+            except Exception:
+                pass  # torch.compile unavailable/unsupported — fall back silently
+
     trained = {}
     for name, model in models.items():
         print(f"Training {name}...")
-        train_dataset = TensorDataset(torch.tensor(X_train_scaled, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
-        train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True, pin_memory=True)
-        val_loader = DataLoader(train_dataset, batch_size=512, shuffle=False, pin_memory=True)
+        train_loader = GPUBatcher(X_train_t, y_train_t, BATCH_SIZE, shuffle=True)
+        val_loader = GPUBatcher(X_val_t, y_val_t, BATCH_SIZE, shuffle=False)
         if name == 'EDS_V2':
             model = train_eds(model, train_loader, val_loader, epochs=10, lr=0.001)
-        elif name == 'LSTM':
-            model = train_lstm(model, train_loader, val_loader, epochs=10, lr=0.001)
         else:
-            model = train_transformer(model, train_loader, val_loader, epochs=10, lr=0.001)
+            model = train_simple(model, train_loader, val_loader, epochs=10, lr=0.001, name=name)
         trained[name] = model
 
-    lr_model = LinearRegression()
+    lr_model = LinearRegression(n_jobs=-1)
     lr_model.fit(X_train_scaled.reshape(X_train_scaled.shape[0], -1), y_train)
-    xgb_model = xgb.XGBRegressor(n_estimators=100, max_depth=5, random_state=42, tree_method='hist', device='cuda' if torch.cuda.is_available() else 'cpu')
+    xgb_model = xgb.XGBRegressor(
+        n_estimators=100, max_depth=5, random_state=42,
+        tree_method='hist', device='cuda' if torch.cuda.is_available() else 'cpu',
+        n_jobs=-1,
+    )
     xgb_model.fit(X_train_scaled.reshape(X_train_scaled.shape[0], -1), y_train)
 
     all_preds = {}
     for name, model in trained.items():
         if name == 'EDS_V2':
-            mu, var = evaluate_model_variance(model, X_test_scaled, batch_size=4096)
+            mu, var = evaluate_model_variance(model, X_test_t, batch_size=8192)
             all_preds['EDS_V2_mu'] = mu
             all_preds['EDS_V2_var'] = var
         else:
-            all_preds[name] = evaluate_model_batched(model, X_test_scaled, batch_size=4096)
+            all_preds[name] = evaluate_model_batched(model, X_test_t, batch_size=8192)
     all_preds['Linear'] = lr_model.predict(X_test_scaled.reshape(X_test_scaled.shape[0], -1))
     all_preds['XGBoost'] = xgb_model.predict(X_test_scaled.reshape(X_test_scaled.shape[0], -1))
 
@@ -416,42 +469,34 @@ def main():
     for name, preds in all_preds.items():
         if name.endswith('_mu') or name.endswith('_var'):
             continue
-        ic = spearmanr(preds, y_test)[0]
-        ic_results[name] = ic
-    for name, preds in all_preds.items():
-        if name.endswith('_mu') or name.endswith('_var'):
-            continue
-        ret = compute_strategy_returns_kelly(preds, np.ones_like(preds)*0.01, y_test, top=0.1, lambda_reg=1e-3, tc=0.001)
-        strat_ret[name] = ret
+        ic_results[name] = spearmanr(preds, y_test)[0]
+        strat_ret[name] = compute_strategy_returns_kelly(preds, np.ones_like(preds) * 0.01, y_test, top=0.1, lambda_reg=1e-3, tc=0.001)
+
     if 'EDS_V2_mu' in all_preds and 'EDS_V2_var' in all_preds:
         mu = all_preds['EDS_V2_mu']
         var = all_preds['EDS_V2_var']
-        ic_eds = spearmanr(mu, y_test)[0]
-        ic_results['EDS_V2'] = ic_eds
-        ret_eds = compute_strategy_returns_kelly(mu, var, y_test, top=0.1, lambda_reg=1e-3, tc=0.001)
-        strat_ret['EDS_V2'] = ret_eds
+        ic_results['EDS_V2'] = spearmanr(mu, y_test)[0]
+        strat_ret['EDS_V2'] = compute_strategy_returns_kelly(mu, var, y_test, top=0.1, lambda_reg=1e-3, tc=0.001)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    ax = axes[0,0]
+    ax = axes[0, 0]
     for name, ret in strat_ret.items():
         ax.plot(np.cumsum(ret), label=name)
     ax.set_title('Cumulative Long-Short Returns (with Kelly)')
     ax.legend()
     ax.grid(True)
-    ax = axes[0,1]
-    ic_names = list(ic_results.keys())
-    ic_vals = list(ic_results.values())
-    ax.bar(ic_names, ic_vals)
+    ax = axes[0, 1]
+    ax.bar(list(ic_results.keys()), list(ic_results.values()))
     ax.set_title('Cross-Sectional IC (Spearman)')
     ax.grid(True)
-    ax = axes[1,0]
+    ax = axes[1, 0]
     for name, ret in strat_ret.items():
         ax.plot(np.cumsum(ret), label=name)
     ax.set_title('Cumulative Returns (Log scale)')
     ax.set_yscale('log')
     ax.legend()
     ax.grid(True)
-    ax = axes[1,1]
+    ax = axes[1, 1]
     sharpe = {name: np.mean(ret) / (np.std(ret) + 1e-8) * np.sqrt(252) for name, ret in strat_ret.items()}
     ax.bar(list(sharpe.keys()), list(sharpe.values()))
     ax.set_title('Sharpe Ratio (Annualized)')

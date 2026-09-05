@@ -130,7 +130,7 @@ This is different from giving a Transformer or an LSTM a pile of price/volume fe
 **The new market representation** — instead of a flat feature vector, the market state is:
 
 $$
-M_t = \left\{ z_t^{\mathrm{obs}},\ z_t^{\mathrm{eq}},\ \dot{z}_t^{\mathrm{obs}},\ \Delta z_t \right\}
+M_t = \{ z_t^{\mathrm{obs}},\ z_t^{\mathrm{eq}},\ \dot{z}_t^{\mathrm{obs}},\ \Delta z_t \}
 $$
 
 **What this means:** rather than one snapshot, the model keeps track of *position* ($z^{obs}$), *reference point* ($z^{eq}$), *velocity* ($\dot z^{obs}$, i.e. rate of change), and *displacement* ($\Delta z_t$) — the same set of quantities you'd track for a physical object on a spring.

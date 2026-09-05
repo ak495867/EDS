@@ -95,13 +95,20 @@ def compute_features_and_target_for_asset(df, horizon=5, seq_len=20):
 
 def create_sequences(features, targets, seq_len, horizon):
     # Vectorized via sliding_window_view instead of a Python append loop.
+    # Original loop: for i in range(seq_len, len(features)-horizon):
+    #     X = features[i-seq_len:i], y = targets[i]
+    # -> i ranges [seq_len, n-1] where n = len(features)-horizon, giving
+    #    (n - seq_len) samples. sliding_window_view over features[:n] would
+    #    give (n - seq_len + 1) windows (one too many), so we window over
+    #    features[:n-1] instead to match exactly.
     n = len(features) - horizon
     if n <= seq_len:
         return np.array([]), np.array([])
-    windows = np.lib.stride_tricks.sliding_window_view(features[:n], seq_len, axis=0)
+    windows = np.lib.stride_tricks.sliding_window_view(features[:n - 1], seq_len, axis=0)
     # sliding_window_view puts the window axis last; move it to axis=1
     windows = np.moveaxis(windows, -1, 1)  # (num_windows, seq_len, n_features)
     y = targets[seq_len:n]
+    assert windows.shape[0] == y.shape[0], (windows.shape[0], y.shape[0])
     finite_mask = np.all(np.isfinite(windows.reshape(windows.shape[0], -1)), axis=1) & np.isfinite(y)
     return windows[finite_mask].astype(np.float32), y[finite_mask].astype(np.float32)
 

@@ -156,24 +156,20 @@ class EDSModelV2(nn.Module):
         h = self.encoder(x)
         z_eq_seq, _ = self.gru_eq(h)
         impulse_seq, _ = self.impulse_rnn(x)
-        z = torch.zeros(batch_size, self.latent_dim, device=x.device, requires_grad=True)
-        v = torch.zeros(batch_size, self.latent_dim, device=x.device, requires_grad=True)
-        z_seq, v_seq, z_eq_out, delta_seq, impulse_list = [], [], [], [], []
+        z = torch.zeros(batch_size, self.latent_dim, device=x.device)
+        v = torch.zeros(batch_size, self.latent_dim, device=x.device)
+        z_seq, v_seq, z_eq_out, delta_seq, impulse_list, grad_V_list = [], [], [], [], [], []
         for t in range(seq_len):
             z_eq = z_eq_seq[:, t, :]
             delta = z - z_eq
+            delta.requires_grad_(True)
             vol = x[:, t, 6].unsqueeze(-1)
             beta = self.beta_net(vol)
             z_eq = z_eq + beta * delta
             impulse = impulse_seq[:, t, :]
-            # compute gradient of potential
-            if delta.requires_grad:
-                V_vals = self.V(delta).squeeze(-1)
-                V_total = V_vals.sum()
-                grad_V = torch.autograd.grad(V_total, delta, create_graph=True)[0]
-            else:
-                # fallback (should not happen)
-                grad_V = torch.zeros_like(delta)
+            V_vals = self.V(delta).squeeze(-1)
+            V_total = V_vals.sum()
+            grad_V = torch.autograd.grad(V_total, delta, create_graph=True)[0]
             acc = -self.gamma * v - grad_V + impulse
             v = v + acc
             z = z + v
@@ -182,11 +178,13 @@ class EDSModelV2(nn.Module):
             z_eq_out.append(z_eq)
             delta_seq.append(delta)
             impulse_list.append(impulse)
+            grad_V_list.append(grad_V)
         z_seq = torch.stack(z_seq, dim=1)
         v_seq = torch.stack(v_seq, dim=1)
         z_eq_seq = torch.stack(z_eq_out, dim=1)
         delta_seq = torch.stack(delta_seq, dim=1)
         impulse_seq = torch.stack(impulse_list, dim=1)
+        grad_V_seq = torch.stack(grad_V_list, dim=1)
         final_z = z_seq[:, -1, :]
         final_v = v_seq[:, -1, :]
         final_eq = z_eq_seq[:, -1, :]
@@ -195,27 +193,13 @@ class EDSModelV2(nn.Module):
         feat = torch.cat([final_z, final_v, final_eq, V_final], dim=1)
         mu = self.mu_head(feat).squeeze(-1)
         logvar = self.logvar_head(feat).squeeze(-1)
-        return mu, logvar, z_seq, v_seq, z_eq_seq, delta_seq, impulse_seq
+        return mu, logvar, z_seq, v_seq, z_eq_seq, delta_seq, impulse_seq, grad_V_seq
 
-    def compute_loss(self, mu, logvar, target, z_seq, v_seq, z_eq_seq, delta_seq, impulse_seq, lambda1=0.1, lambda2=0.01):
+    def compute_loss(self, mu, logvar, target, z_seq, v_seq, z_eq_seq, delta_seq, impulse_seq, grad_V_seq, lambda1=0.1, lambda2=0.01):
         pred_loss = 0.5 * (logvar + (target - mu)**2 / torch.exp(logvar)).mean()
-        # dynamics loss: we want actual acceleration to match predicted acceleration
         acc_actual = v_seq[:, 1:, :] - v_seq[:, :-1, :]
-        # compute predicted acceleration from delta_seq (grad_V) and impulse_seq
-        acc_pred_list = []
-        for t in range(delta_seq.size(1) - 1):
-            delta_t = delta_seq[:, t, :]
-            if not delta_t.requires_grad:
-                delta_t.requires_grad_(True)
-            V_vals = self.V(delta_t).squeeze(-1)
-            V_total = V_vals.sum()
-            grad_V = torch.autograd.grad(V_total, delta_t, create_graph=True)[0]
-            v_t = v_seq[:, t, :]
-            impulse_t = impulse_seq[:, t, :]
-            acc_pred = -self.gamma * v_t - grad_V + impulse_t
-            acc_pred_list.append(acc_pred)
-        acc_pred_seq = torch.stack(acc_pred_list, dim=1)
-        dyn_loss = nn.functional.mse_loss(acc_actual, acc_pred_seq)
+        acc_pred = -self.gamma * v_seq[:, :-1, :] - grad_V_seq[:, :-1, :] + impulse_seq[:, :-1, :]
+        dyn_loss = nn.functional.mse_loss(acc_actual, acc_pred)
         stab_loss = nn.functional.mse_loss(z_eq_seq[:, 1:, :], z_eq_seq[:, :-1, :])
         return pred_loss + lambda1 * dyn_loss + lambda2 * stab_loss
 
@@ -251,8 +235,8 @@ def train_eds(model, train_loader, val_loader, epochs=10, lr=0.001):
         for Xb, yb in tqdm(train_loader, desc=f'EDS Epoch {epoch+1}/{epochs}'):
             Xb, yb = Xb.to(device), yb.to(device)
             optimizer.zero_grad()
-            mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq = model(Xb)
-            loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq)
+            mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq = model(Xb)
+            loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq)
             loss.backward()
             optimizer.step()
         model.eval()
@@ -260,8 +244,8 @@ def train_eds(model, train_loader, val_loader, epochs=10, lr=0.001):
         with torch.no_grad():
             for Xb, yb in val_loader:
                 Xb, yb = Xb.to(device), yb.to(device)
-                mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq = model(Xb)
-                loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq)
+                mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq = model(Xb)
+                loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq)
                 val_loss += loss.item()
         val_loss /= len(val_loader)
         if val_loss < best_loss:
@@ -321,7 +305,7 @@ def evaluate_model_batched(model, X_test, batch_size=4096):
         for Xb, in loader:
             Xb = Xb.to(device)
             if hasattr(model, 'mu_head'):
-                mu, _, _, _, _, _, _ = model(Xb)
+                mu, _, _, _, _, _, _, _ = model(Xb)
                 preds.append(mu.cpu().numpy())
             else:
                 preds.append(model(Xb).cpu().numpy())
@@ -335,7 +319,7 @@ def evaluate_model_variance(model, X_test, batch_size=4096):
     with torch.no_grad():
         for Xb, in loader:
             Xb = Xb.to(device)
-            mu, logvar, _, _, _, _, _ = model(Xb)
+            mu, logvar, _, _, _, _, _, _ = model(Xb)
             mus.append(mu.cpu().numpy())
             logvars.append(logvar.cpu().numpy())
     return np.concatenate(mus), np.exp(np.concatenate(logvars))
@@ -396,8 +380,8 @@ def main():
     for name, model in models.items():
         print(f"Training {name}...")
         train_dataset = TensorDataset(torch.tensor(X_train_scaled, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
-        train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True, pin_memory=True)
-        val_loader = DataLoader(train_dataset, batch_size=1024, shuffle=False, pin_memory=True)
+        train_loader = DataLoader(train_dataset, batch_size=512, shuffle=True, pin_memory=True)
+        val_loader = DataLoader(train_dataset, batch_size=512, shuffle=False, pin_memory=True)
         if name == 'EDS_V2':
             model = train_eds(model, train_loader, val_loader, epochs=10, lr=0.001)
         elif name == 'LSTM':

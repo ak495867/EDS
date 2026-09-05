@@ -156,8 +156,9 @@ class EDSModelV2(nn.Module):
         h = self.encoder(x)
         z_eq_seq, _ = self.gru_eq(h)
         impulse_seq, _ = self.impulse_rnn(x)
-        z = torch.zeros(batch_size, self.latent_dim, device=x.device)
-        v = torch.zeros(batch_size, self.latent_dim, device=x.device)
+        # Initialize state and velocity with requires_grad=True
+        z = torch.zeros(batch_size, self.latent_dim, device=x.device, requires_grad=True)
+        v = torch.zeros(batch_size, self.latent_dim, device=x.device, requires_grad=True)
         z_seq, v_seq, z_eq_out, delta_seq, impulse_list, grad_V_list = [], [], [], [], [], []
         for t in range(seq_len):
             z_eq = z_eq_seq[:, t, :]

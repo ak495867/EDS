@@ -1,4 +1,4 @@
-# The Equilibrium Dissipation Signal (EDS) Model — Math & Implementation Guide
+# The Equilibrium Dissipation Signal (EDS) Model : Math & Implementation Guide
 
 > **Who this is for:** you don't need a finance or math background to read this. Every symbol is defined before it's used, every formula gets a plain-English explanation right after it, and there's a worked numeric example near the end. If you already know quant finance, skim the notation table and jump to Section 4 onward.
 
@@ -130,7 +130,7 @@ This is different from giving a Transformer or an LSTM a pile of price/volume fe
 **The new market representation** — instead of a flat feature vector, the market state is:
 
 $$
-M_t = \left\{ z_t^{obs},\ z_t^{eq},\ \dot{z}_t^{obs},\ \Delta z_t \right\}
+M_t = \left\{ z_t^{\mathrm{obs}},\ z_t^{\mathrm{eq}},\ \dot{z}_t^{\mathrm{obs}},\ \Delta z_t \right\}
 $$
 
 **What this means:** rather than one snapshot, the model keeps track of *position* ($z^{obs}$), *reference point* ($z^{eq}$), *velocity* ($\dot z^{obs}$, i.e. rate of change), and *displacement* ($\Delta z_t$) — the same set of quantities you'd track for a physical object on a spring.

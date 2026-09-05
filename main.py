@@ -173,13 +173,13 @@ def prepare_panel_data(asset_data, horizon=5, seq_len=20):
     return X_all, y_all, dates_all, tickers_all
 
 # ---------------------------------------------------------------------------
-# Models (unchanged math — EDS_V2's per-step autograd.grad is inherent to the
+# Models (unchanged math — EDS's per-step autograd.grad is inherent to the
 # physics-style dynamics and can't be vectorized across time because z_eq at
 # step t depends on z at step t-1. We speed it up with AMP + torch.compile
 # instead of changing the model.)
 # ---------------------------------------------------------------------------
 
-class EDSModelV2(nn.Module):
+class EDSModel(nn.Module):
     def __init__(self, input_dim, latent_dim=16, seq_len=20, horizon=5, gamma=0.15):
         super().__init__()
         self.latent_dim = latent_dim
@@ -428,7 +428,7 @@ def main():
     BATCH_SIZE = 2048  # bumped up from 512 — per-step ops are tiny, so small batches under-use the GPU
 
     models = {
-        'EDS_V2': EDSModelV2(input_dim=X_train.shape[-1], latent_dim=16, seq_len=20, horizon=5, gamma=0.15),
+        'EDS': EDSModel(input_dim=X_train.shape[-1], latent_dim=16, seq_len=20, horizon=5, gamma=0.15),
         'LSTM': LSTMModel(input_dim=X_train.shape[-1]),
         'Transformer': TransformerModel(input_dim=X_train.shape[-1]),
     }
@@ -445,7 +445,7 @@ def main():
         print(f"Training {name}...")
         train_loader = GPUBatcher(X_train_t, y_train_t, BATCH_SIZE, shuffle=True)
         val_loader = GPUBatcher(X_val_t, y_val_t, BATCH_SIZE, shuffle=False)
-        if name == 'EDS_V2':
+        if name == 'EDS':
             model = train_eds(model, train_loader, val_loader, epochs=10, lr=0.001)
         else:
             model = train_simple(model, train_loader, val_loader, epochs=10, lr=0.001, name=name)
@@ -462,10 +462,10 @@ def main():
 
     all_preds = {}
     for name, model in trained.items():
-        if name == 'EDS_V2':
+        if name == 'EDS':
             mu, var = evaluate_model_variance(model, X_test_t, batch_size=8192)
-            all_preds['EDS_V2_mu'] = mu
-            all_preds['EDS_V2_var'] = var
+            all_preds['EDS_mu'] = mu
+            all_preds['EDS_var'] = var
         else:
             all_preds[name] = evaluate_model_batched(model, X_test_t, batch_size=8192)
     all_preds['Linear'] = lr_model.predict(X_test_scaled.reshape(X_test_scaled.shape[0], -1))
@@ -479,11 +479,11 @@ def main():
         ic_results[name] = spearmanr(preds, y_test)[0]
         strat_ret[name] = compute_strategy_returns_kelly(preds, np.ones_like(preds) * 0.01, y_test, top=0.1, lambda_reg=1e-3, tc=0.001)
 
-    if 'EDS_V2_mu' in all_preds and 'EDS_V2_var' in all_preds:
-        mu = all_preds['EDS_V2_mu']
-        var = all_preds['EDS_V2_var']
-        ic_results['EDS_V2'] = spearmanr(mu, y_test)[0]
-        strat_ret['EDS_V2'] = compute_strategy_returns_kelly(mu, var, y_test, top=0.1, lambda_reg=1e-3, tc=0.001)
+    if 'EDS_mu' in all_preds and 'EDS_var' in all_preds:
+        mu = all_preds['EDS_mu']
+        var = all_preds['EDS_var']
+        ic_results['EDS'] = spearmanr(mu, y_test)[0]
+        strat_ret['EDS'] = compute_strategy_returns_kelly(mu, var, y_test, top=0.1, lambda_reg=1e-3, tc=0.001)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     ax = axes[0, 0]
@@ -509,7 +509,7 @@ def main():
     ax.set_title('Sharpe Ratio (Annualized)')
     ax.grid(True)
     plt.tight_layout()
-    plt.savefig('eds_v2_eval.png')
+    plt.savefig('eds_eval.png')
     plt.show()
 
     print("IC Results:")

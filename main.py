@@ -17,17 +17,15 @@ import warnings
 from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
-
 torch.manual_seed(42)
 np.random.seed(42)
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
-
-# If running on CUDA, try to set memory allocation to allow fragmentation handling
 if torch.cuda.is_available():
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-def get_tickers(n=200):
+def get_tickers(n=150):
     tickers = []
     try:
         url = 'https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv'
@@ -137,76 +135,86 @@ def prepare_panel_data(asset_data, horizon=5, seq_len=20):
     tickers_all = np.concatenate(all_tickers)[mask]
     return X_all, y_all, dates_all, tickers_all
 
-class EDSModel(nn.Module):
-    def __init__(self, input_dim, latent_dim=16, seq_len=20, horizon=5, lambda_restore=0.5):
-        super(EDSModel, self).__init__()
+class EDSModelV2(nn.Module):
+    def __init__(self, input_dim, latent_dim=16, seq_len=20, horizon=5, gamma=0.15):
+        super().__init__()
         self.latent_dim = latent_dim
         self.seq_len = seq_len
         self.horizon = horizon
-        self.lambda_restore = lambda_restore
+        self.gamma = gamma
         self.encoder = nn.Sequential(nn.Linear(input_dim, 64), nn.ReLU(), nn.Linear(64, latent_dim))
+        self.impulse_rnn = nn.GRU(input_dim, latent_dim, batch_first=True)
         self.gru_eq = nn.GRU(latent_dim, latent_dim, batch_first=True)
-        self.impulse_net = nn.Sequential(nn.Linear(input_dim, 64), nn.ReLU(), nn.Linear(64, latent_dim))
-        self.pred_head = nn.Sequential(
-            nn.Linear(latent_dim * 3 + 1, 64), nn.ReLU(), nn.Linear(64, 1)
-        )
+        self.V = nn.Sequential(nn.Linear(latent_dim, 32), nn.ReLU(), nn.Linear(32, 1))
+        self.beta_net = nn.Sequential(nn.Linear(1, 16), nn.ReLU(), nn.Linear(16, 1), nn.Sigmoid())
+        self.mu_head = nn.Sequential(nn.Linear(latent_dim*3 + 1, 64), nn.ReLU(), nn.Linear(64, 1))
+        self.logvar_head = nn.Sequential(nn.Linear(latent_dim*3 + 1, 64), nn.ReLU(), nn.Linear(64, 1))
         self.to(device)
 
     def forward(self, x):
         batch_size, seq_len, _ = x.shape
         h = self.encoder(x)
         z_eq_seq, _ = self.gru_eq(h)
-        z_obs = torch.zeros(batch_size, self.latent_dim, device=x.device)
-        z_obs_seq, delta_z_seq, dz_pred_seq = [], [], []
+        impulse_seq, _ = self.impulse_rnn(x)
+        z = torch.zeros(batch_size, self.latent_dim, device=x.device)
+        v = torch.zeros(batch_size, self.latent_dim, device=x.device)
+        z_seq, v_seq, z_eq_out, acc_pred_seq = [], [], [], []
         for t in range(seq_len):
-            z_eq_t = z_eq_seq[:, t, :]
-            delta_z = z_obs - z_eq_t
-            impulse = self.impulse_net(x[:, t, :])
-            dz = -self.lambda_restore * delta_z + impulse
-            z_obs = z_obs + dz
-            z_obs_seq.append(z_obs)
-            delta_z_seq.append(delta_z)
-            dz_pred_seq.append(dz)
-        z_obs_seq = torch.stack(z_obs_seq, dim=1)
-        delta_z_seq = torch.stack(delta_z_seq, dim=1)
-        dz_pred_seq = torch.stack(dz_pred_seq, dim=1)
-        pred_in = torch.cat([
-            z_obs_seq[:, -1, :],
-            z_eq_seq[:, -1, :],
-            delta_z_seq[:, -1, :],
-            dz_pred_seq[:, -1, :].norm(dim=1, keepdim=True)
-        ], dim=1)
-        return self.pred_head(pred_in).squeeze(-1), z_obs_seq, z_eq_seq, delta_z_seq, dz_pred_seq
+            z_eq = z_eq_seq[:, t, :]
+            delta = z - z_eq
+            V_vals = self.V(delta).squeeze(-1)
+            V_total = V_vals.sum()
+            grad_V = torch.autograd.grad(V_total, delta, create_graph=True)[0]
+            vol = x[:, t, 6].unsqueeze(-1)
+            beta = self.beta_net(vol)
+            z_eq = z_eq + beta * delta
+            impulse = impulse_seq[:, t, :]
+            acc = -self.gamma * v - grad_V + impulse
+            v = v + acc
+            z = z + v
+            z_seq.append(z)
+            v_seq.append(v)
+            z_eq_out.append(z_eq)
+            acc_pred_seq.append(acc)
+        z_seq = torch.stack(z_seq, dim=1)
+        v_seq = torch.stack(v_seq, dim=1)
+        z_eq_seq = torch.stack(z_eq_out, dim=1)
+        final_z = z_seq[:, -1, :]
+        final_v = v_seq[:, -1, :]
+        final_eq = z_eq_seq[:, -1, :]
+        delta_final = final_z - final_eq
+        V_final = self.V(delta_final)
+        feat = torch.cat([final_z, final_v, final_eq, V_final], dim=1)
+        mu = self.mu_head(feat).squeeze(-1)
+        logvar = self.logvar_head(feat).squeeze(-1)
+        return mu, logvar, z_seq, v_seq, z_eq_seq, torch.stack(acc_pred_seq, dim=1)
 
-    def compute_loss(self, pred, target, z_obs_seq, z_eq_seq, delta_z_seq, dz_pred_seq, lambda1=0.1, lambda2=0.01):
-        pred_loss = nn.functional.mse_loss(pred, target)
-        dz_actual = z_obs_seq[:, 1:, :] - z_obs_seq[:, :-1, :]
-        dz_pred = dz_pred_seq[:, :-1, :]
-        dynamics_loss = nn.functional.mse_loss(dz_actual, dz_pred)
-        stability_loss = nn.functional.mse_loss(z_eq_seq[:, 1:, :], z_eq_seq[:, :-1, :])
-        return pred_loss + lambda1 * dynamics_loss + lambda2 * stability_loss
+    def compute_loss(self, mu, logvar, target, z_seq, v_seq, z_eq_seq, acc_pred, lambda1=0.1, lambda2=0.01):
+        pred_loss = 0.5 * (logvar + (target - mu)**2 / torch.exp(logvar)).mean()
+        acc_actual = v_seq[:, 1:, :] - v_seq[:, :-1, :]
+        dyn_loss = nn.functional.mse_loss(acc_actual, acc_pred[:, :-1, :])
+        stab_loss = nn.functional.mse_loss(z_eq_seq[:, 1:, :], z_eq_seq[:, :-1, :])
+        return pred_loss + lambda1 * dyn_loss + lambda2 * stab_loss
 
 class LSTMModel(nn.Module):
     def __init__(self, input_dim, hidden_dim=64, num_layers=2):
-        super(LSTMModel, self).__init__()
+        super().__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_dim, 1)
         self.to(device)
-
     def forward(self, x):
         out, _ = self.lstm(x)
         return self.fc(out[:, -1, :]).squeeze(-1)
 
 class TransformerModel(nn.Module):
-    def __init__(self, input_dim, d_model=32, nhead=2, num_layers=2):  # Reduced sizes to save memory
-        super(TransformerModel, self).__init__()
+    def __init__(self, input_dim, d_model=32, nhead=2, num_layers=2):
+        super().__init__()
         self.embed = nn.Linear(input_dim, d_model)
         self.pos_enc = nn.Parameter(torch.randn(1, 1000, d_model) * 0.1)
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.fc = nn.Linear(d_model, 1)
         self.to(device)
-
     def forward(self, x):
         seq_len = x.size(1)
         x = self.embed(x) + self.pos_enc[:, :seq_len, :]
@@ -214,14 +222,14 @@ class TransformerModel(nn.Module):
 
 def train_eds(model, train_loader, val_loader, epochs=20, lr=0.001):
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    best_val_loss = float('inf')
+    best_loss = float('inf')
     for epoch in range(epochs):
         model.train()
         for Xb, yb in tqdm(train_loader, desc=f'EDS Epoch {epoch+1}/{epochs}'):
             Xb, yb = Xb.to(device), yb.to(device)
             optimizer.zero_grad()
-            pred, z_obs, z_eq, delta, dz_pred = model(Xb)
-            loss = model.compute_loss(pred, yb, z_obs, z_eq, delta, dz_pred)
+            mu, logvar, z_seq, v_seq, z_eq, acc_pred = model(Xb)
+            loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, acc_pred)
             loss.backward()
             optimizer.step()
         model.eval()
@@ -229,17 +237,17 @@ def train_eds(model, train_loader, val_loader, epochs=20, lr=0.001):
         with torch.no_grad():
             for Xb, yb in val_loader:
                 Xb, yb = Xb.to(device), yb.to(device)
-                pred, z_obs, z_eq, delta, dz_pred = model(Xb)
-                loss = model.compute_loss(pred, yb, z_obs, z_eq, delta, dz_pred)
+                mu, logvar, z_seq, v_seq, z_eq, acc_pred = model(Xb)
+                loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, acc_pred)
                 val_loss += loss.item()
         val_loss /= len(val_loader)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_loss < best_loss:
+            best_loss = val_loss
     return model
 
 def train_lstm(model, train_loader, val_loader, epochs=20, lr=0.001):
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    best_val_loss = float('inf')
+    best_loss = float('inf')
     for epoch in range(epochs):
         model.train()
         for Xb, yb in tqdm(train_loader, desc=f'LSTM Epoch {epoch+1}/{epochs}'):
@@ -255,13 +263,13 @@ def train_lstm(model, train_loader, val_loader, epochs=20, lr=0.001):
                 Xb, yb = Xb.to(device), yb.to(device)
                 val_loss += nn.functional.mse_loss(model(Xb), yb).item()
         val_loss /= len(val_loader)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_loss < best_loss:
+            best_loss = val_loss
     return model
 
 def train_transformer(model, train_loader, val_loader, epochs=20, lr=0.001):
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    best_val_loss = float('inf')
+    best_loss = float('inf')
     for epoch in range(epochs):
         model.train()
         for Xb, yb in tqdm(train_loader, desc=f'Transformer Epoch {epoch+1}/{epochs}'):
@@ -277,34 +285,56 @@ def train_transformer(model, train_loader, val_loader, epochs=20, lr=0.001):
                 Xb, yb = Xb.to(device), yb.to(device)
                 val_loss += nn.functional.mse_loss(model(Xb), yb).item()
         val_loss /= len(val_loader)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_loss < best_loss:
+            best_loss = val_loss
     return model
 
-def evaluate_model_batched(model, X_test, y_test, batch_size=4096):
-    """Evaluate model in batches to avoid OOM."""
+def evaluate_model_batched(model, X_test, batch_size=4096):
     model.eval()
     dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     preds = []
+    if hasattr(model, 'compute_loss'):
+        with torch.no_grad():
+            for Xb, in loader:
+                Xb = Xb.to(device)
+                mu, logvar, _, _, _, _ = model(Xb)
+                preds.append(mu.cpu().numpy())
+    else:
+        with torch.no_grad():
+            for Xb, in loader:
+                Xb = Xb.to(device)
+                preds.append(model(Xb).cpu().numpy())
+    return np.concatenate(preds)
+
+def evaluate_model_variance(model, X_test, batch_size=4096):
+    model.eval()
+    dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32))
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    mus, logvars = [], []
     with torch.no_grad():
         for Xb, in loader:
             Xb = Xb.to(device)
-            if hasattr(model, 'compute_loss'):
-                pred, _, _, _, _ = model(Xb)
-            else:
-                pred = model(Xb)
-            preds.append(pred.cpu().numpy())
-    return np.concatenate(preds)
+            mu, logvar, _, _, _, _ = model(Xb)
+            mus.append(mu.cpu().numpy())
+            logvars.append(logvar.cpu().numpy())
+    return np.concatenate(mus), np.exp(np.concatenate(logvars))
 
-def compute_strategy_returns(preds, actual, top=0.1):
-    n = len(preds)
-    ranks = np.argsort(preds)
+def compute_strategy_returns_kelly(mu, sigma2, actual, top=0.1, lambda_reg=1e-3, tc=0.001):
+    weights = mu / (sigma2 + lambda_reg)
+    n = len(weights)
+    ranks = np.argsort(weights)
     long_idx = ranks[-int(n*top):]
     short_idx = ranks[:int(n*top)]
-    ret = np.zeros(n)
-    ret[long_idx] += actual[long_idx] / int(n*top)
-    ret[short_idx] -= actual[short_idx] / int(n*top)
+    w = np.zeros(n)
+    w[long_idx] = 1.0 / int(n*top)
+    w[short_idx] = -1.0 / int(n*top)
+    ret = w * actual
+    # transaction cost: assume full rebalance each period
+    # For simplicity, cost is applied per trade; we'll approximate by tc * |w_t - w_{t-1}| but we don't have history here
+    # In this cross-sectional setting, we assume rebalancing daily with full turnover; cost = tc * sum(|w|) (approx)
+    cost = tc * np.sum(np.abs(w))
+    ret -= cost / n  # average cost per asset
     return ret
 
 def main():
@@ -316,7 +346,6 @@ def main():
     if X_all is None:
         print("No data available after preprocessing.")
         return
-
     print(f"Total samples: {len(X_all)}")
     date_series = pd.to_datetime(dates_all)
     unique_dates = np.sort(np.unique(date_series))
@@ -325,7 +354,6 @@ def main():
     if len(train_dates) == 0 or len(test_dates) == 0:
         print("Insufficient date range for split.")
         return
-
     train_mask = np.isin(date_series, train_dates)
     test_mask = np.isin(date_series, test_dates)
     X_train = X_all[train_mask]
@@ -333,20 +361,19 @@ def main():
     X_test = X_all[test_mask]
     y_test = y_all[test_mask]
     print(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
-
     scaler = StandardScaler()
     X_train_flat = X_train.reshape(-1, X_train.shape[-1])
     if np.any(~np.isfinite(X_train_flat)):
-        raise ValueError("Non-finite values found in training data after preprocessing.")
+        raise ValueError("Non-finite values found in training data.")
     scaler.fit(X_train_flat)
     X_train_scaled = scaler.transform(X_train_flat).reshape(X_train.shape)
     X_test_flat = X_test.reshape(-1, X_test.shape[-1])
     X_test_scaled = scaler.transform(X_test_flat).reshape(X_test.shape)
 
     models = {
-        'EDS': EDSModel(input_dim=X_train.shape[-1], latent_dim=16, seq_len=20, horizon=5),
+        'EDS_V2': EDSModelV2(input_dim=X_train.shape[-1], latent_dim=16, seq_len=20, horizon=5, gamma=0.15),
         'LSTM': LSTMModel(input_dim=X_train.shape[-1]),
-        'Transformer': TransformerModel(input_dim=X_train.shape[-1], d_model=32, nhead=2, num_layers=2)
+        'Transformer': TransformerModel(input_dim=X_train.shape[-1])
     }
     trained = {}
     for name, model in models.items():
@@ -354,12 +381,12 @@ def main():
         train_dataset = TensorDataset(torch.tensor(X_train_scaled, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
         train_loader = DataLoader(train_dataset, batch_size=2048, shuffle=True, pin_memory=True)
         val_loader = DataLoader(train_dataset, batch_size=2048, shuffle=False, pin_memory=True)
-        if name == 'EDS':
-            model = train_eds(model, train_loader, val_loader, epochs=20)
+        if name == 'EDS_V2':
+            model = train_eds(model, train_loader, val_loader, epochs=20, lr=0.001)
         elif name == 'LSTM':
-            model = train_lstm(model, train_loader, val_loader, epochs=20)
-        elif name == 'Transformer':
-            model = train_transformer(model, train_loader, val_loader, epochs=20)
+            model = train_lstm(model, train_loader, val_loader, epochs=20, lr=0.001)
+        else:
+            model = train_transformer(model, train_loader, val_loader, epochs=20, lr=0.001)
         trained[name] = model
 
     lr_model = LinearRegression()
@@ -369,26 +396,49 @@ def main():
 
     all_preds = {}
     for name, model in trained.items():
-        all_preds[name] = evaluate_model_batched(model, X_test_scaled, y_test, batch_size=4096)
+        if name == 'EDS_V2':
+            mu, var = evaluate_model_variance(model, X_test_scaled, batch_size=4096)
+            all_preds[name + '_mu'] = mu
+            all_preds[name + '_var'] = var
+        else:
+            all_preds[name] = evaluate_model_batched(model, X_test_scaled, batch_size=4096)
     all_preds['Linear'] = lr_model.predict(X_test_scaled.reshape(X_test_scaled.shape[0], -1))
     all_preds['XGBoost'] = xgb_model.predict(X_test_scaled.reshape(X_test_scaled.shape[0], -1))
 
-    ic_results = {name: spearmanr(preds, y_test)[0] for name, preds in all_preds.items()}
-    strat_ret = {name: compute_strategy_returns(preds, y_test) for name, preds in all_preds.items()}
+    ic_results = {}
+    strat_ret = {}
+    for name, preds in all_preds.items():
+        if name.endswith('_mu') or name.endswith('_var'):
+            continue
+        ic = spearmanr(preds, y_test)[0]
+        ic_results[name] = ic
+    for name, preds in all_preds.items():
+        if name.endswith('_mu') or name.endswith('_var'):
+            continue
+        ret = compute_strategy_returns_kelly(preds, np.ones_like(preds)*0.01, y_test, top=0.1, lambda_reg=1e-3, tc=0.001)
+        strat_ret[name] = ret
+    # EDS V2 uses mu and var
+    if 'EDS_V2_mu' in all_preds and 'EDS_V2_var' in all_preds:
+        mu = all_preds['EDS_V2_mu']
+        var = all_preds['EDS_V2_var']
+        ic_eds = spearmanr(mu, y_test)[0]
+        ic_results['EDS_V2'] = ic_eds
+        ret_eds = compute_strategy_returns_kelly(mu, var, y_test, top=0.1, lambda_reg=1e-3, tc=0.001)
+        strat_ret['EDS_V2'] = ret_eds
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     ax = axes[0,0]
     for name, ret in strat_ret.items():
         ax.plot(np.cumsum(ret), label=name)
-    ax.set_title('Cumulative Long-Short Returns')
+    ax.set_title('Cumulative Long-Short Returns (with Kelly)')
     ax.legend()
     ax.grid(True)
-
     ax = axes[0,1]
-    ax.bar(list(ic_results.keys()), list(ic_results.values()))
+    ic_names = list(ic_results.keys())
+    ic_vals = list(ic_results.values())
+    ax.bar(ic_names, ic_vals)
     ax.set_title('Cross-Sectional IC (Spearman)')
     ax.grid(True)
-
     ax = axes[1,0]
     for name, ret in strat_ret.items():
         ax.plot(np.cumsum(ret), label=name)
@@ -396,21 +446,19 @@ def main():
     ax.set_yscale('log')
     ax.legend()
     ax.grid(True)
-
     ax = axes[1,1]
     sharpe = {name: np.mean(ret) / (np.std(ret) + 1e-8) * np.sqrt(252) for name, ret in strat_ret.items()}
     ax.bar(list(sharpe.keys()), list(sharpe.values()))
     ax.set_title('Sharpe Ratio (Annualized)')
     ax.grid(True)
-
     plt.tight_layout()
-    plt.savefig('eds_multi_asset_eval.png')
+    plt.savefig('eds_v2_eval.png')
     plt.show()
 
     print("IC Results:")
     for name, ic in ic_results.items():
         print(f"{name}: {ic:.4f}")
-    print("\nSharpe Ratios:")
+    print("\nSharpe Ratios (with Kelly & transaction costs):")
     for name, sr in sharpe.items():
         print(f"{name}: {sr:.4f}")
 

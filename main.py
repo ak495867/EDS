@@ -236,7 +236,13 @@ class EDSModel(nn.Module):
         V_final = self.V(delta_final)
         feat = torch.cat([final_z, final_v, final_eq, V_final], dim=1)
         mu = self.mu_head(feat).squeeze(-1)
-        logvar = self.logvar_head(feat).squeeze(-1)
+        # Clamp logvar so sigma2 = exp(logvar) can never collapse toward 0 or
+        # blow up toward inf. Unclamped, an overfit/unstable logvar head can
+        # drive sigma2 -> ~0 for some samples; downstream Kelly-style sizing
+        # (weights = mu / (sigma2 + lambda_reg)) then assigns those samples
+        # enormous position sizes, which can wreck Sharpe even when the
+        # model's rank ordering (IC) is fine on average.
+        logvar = torch.clamp(self.logvar_head(feat).squeeze(-1), min=-8.0, max=8.0)
         return mu, logvar, z_seq, v_seq, z_eq_seq, delta_seq, impulse_seq, grad_V_seq
 
     def compute_loss(self, mu, logvar, target, z_seq, v_seq, z_eq_seq, delta_seq, impulse_seq, grad_V_seq, lambda1=0.1, lambda2=0.01):
@@ -293,10 +299,14 @@ class GPUBatcher:
     def __len__(self):
         return (self.n + self.batch_size - 1) // self.batch_size
 
-def train_eds(model, train_loader, val_loader, epochs=10, lr=0.001):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+def train_eds(model, train_loader, val_loader, epochs=10, lr=0.001, weight_decay=1e-4,
+              grad_clip=1.0, patience=3):
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1)
     scaler = torch.cuda.amp.GradScaler(enabled=AMP_ENABLED)
     best_loss = float('inf')
+    best_state = None
+    epochs_no_improve = 0
     for epoch in range(epochs):
         model.train()
         for Xb, yb in tqdm(train_loader, desc=f'EDS Epoch {epoch+1}/{epochs}'):
@@ -305,6 +315,10 @@ def train_eds(model, train_loader, val_loader, epochs=10, lr=0.001):
                 mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq = model(Xb)
                 loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq)
             scaler.scale(loss).backward()
+            # The 20-step recurrent unroll with create_graph=True (double
+            # backward) is prone to exploding gradients; clip before stepping.
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
         model.eval()
@@ -314,9 +328,24 @@ def train_eds(model, train_loader, val_loader, epochs=10, lr=0.001):
             loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq)
             val_loss += loss.item()
         val_loss /= max(len(val_loader), 1)
+        scheduler.step(val_loss)
+        print(f"  EDS val_loss={val_loss:.6f}")
+
         if val_loss < best_loss:
             best_loss = val_loss
-        print(f"  EDS val_loss={val_loss:.6f}")
+            # Deep-copy the weights, not a reference — state_dict() tensors
+            # would otherwise keep getting mutated by subsequent epochs.
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"  EDS early stopping at epoch {epoch+1} (best val_loss={best_loss:.6f} at an earlier epoch)")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        print(f"  EDS restored best checkpoint (val_loss={best_loss:.6f})")
     return model
 
 def train_simple(model, train_loader, val_loader, epochs=10, lr=0.001, name='model'):

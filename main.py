@@ -156,7 +156,6 @@ class EDSModelV2(nn.Module):
         h = self.encoder(x)
         z_eq_seq, _ = self.gru_eq(h)
         impulse_seq, _ = self.impulse_rnn(x)
-        # Initialize state and velocity with requires_grad=True
         z = torch.zeros(batch_size, self.latent_dim, device=x.device, requires_grad=True)
         v = torch.zeros(batch_size, self.latent_dim, device=x.device, requires_grad=True)
         z_seq, v_seq, z_eq_out, delta_seq, impulse_list, grad_V_list = [], [], [], [], [], []
@@ -242,12 +241,14 @@ def train_eds(model, train_loader, val_loader, epochs=10, lr=0.001):
             optimizer.step()
         model.eval()
         val_loss = 0.0
-        with torch.no_grad():
-            for Xb, yb in val_loader:
-                Xb, yb = Xb.to(device), yb.to(device)
-                mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq = model(Xb)
-                loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq)
-                val_loss += loss.item()
+        for Xb, yb in val_loader:
+            Xb, yb = Xb.to(device), yb.to(device)
+            mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq = model(Xb)
+            loss = model.compute_loss(mu, logvar, yb, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq)
+            val_loss += loss.item()
+            del mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq, loss
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         val_loss /= len(val_loader)
         if val_loss < best_loss:
             best_loss = val_loss
@@ -317,12 +318,15 @@ def evaluate_model_variance(model, X_test, batch_size=4096):
     dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     mus, logvars = [], []
-    with torch.no_grad():
-        for Xb, in loader:
-            Xb = Xb.to(device)
-            mu, logvar, _, _, _, _, _, _ = model(Xb)
-            mus.append(mu.cpu().numpy())
-            logvars.append(logvar.cpu().numpy())
+    for Xb, in loader:
+        Xb = Xb.to(device)
+        with torch.enable_grad():
+            mu, logvar, z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq = model(Xb)
+        mus.append(mu.detach().cpu().numpy())
+        logvars.append(logvar.detach().cpu().numpy())
+        del z_seq, v_seq, z_eq, delta_seq, impulse_seq, grad_V_seq, mu, logvar
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     return np.concatenate(mus), np.exp(np.concatenate(logvars))
 
 def compute_strategy_returns_kelly(mu, sigma2, actual, top=0.1, lambda_reg=1e-3, tc=0.001):

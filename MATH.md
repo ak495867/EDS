@@ -1,327 +1,308 @@
-# The Equilibrium Dissipation Signal (EDS) Model : Math & Implementation Guide
+# EDS — Equilibrium Dissipation Signal Model
+### A Beginner-Friendly Mathematical & Implementation Guide
 
-> **Who this is for:** you don't need a finance or math background to read this. Every symbol is defined before it's used, every formula gets a plain-English explanation right after it, and there's a worked numeric example near the end. If you already know quant finance, skim the notation table and jump to Section 4 onward.
-
----
-
-## 0. The one-sentence idea
-
-> Markets get "knocked" out of their resting state by news. **The knock itself — not the resting state — is where the tradeable signal lives.**
-
-Think of a market like a **stretched rubber band**. News stretches it away from its natural resting length. The band doesn't snap back instantly — it pulls back over time, and *how fast and how hard it pulls back* tells you something about what's about to happen to the price. EDS is a model built entirely around measuring that stretch-and-snap-back process.
+> **Who this is for:** you don't need a PhD in physics or a background in stochastic calculus to read this. Every symbol is defined the first time it appears, every formula is followed by a plain-English translation, and every section builds on the one before it. If you know what a "moving average" and a "for loop" are, you can follow this document end to end.
 
 ---
 
-## 1. Notation glossary — read this before anything else
+## 1. What EDS Is Trying to Do
 
-Every symbol used later is defined here first. Come back to this table any time you get lost.
+Most trading models ask: *"given these numbers, what happens next?"* They throw price history, volume, and maybe some technical indicators into a model (Random Forest, LSTM, Transformer) and let it find patterns.
 
-| Symbol | Plain-English meaning | Type |
-|---|---|---|
-| $t$ | A point in time (e.g., a specific minute) | index |
-| $X_t$ | Raw market data at time $t$ (price, volume, order book, etc.) | vector of numbers |
-| $z_t^{eq}$ | The **equilibrium state** — the model's guess at what the market's "resting length" looks like right now | vector, dimension $d$ |
-| $z_t^{obs}$ | The **observed state** — the model's guess at what the market's *actual current* state looks like, stretched or not | vector, dimension $d$ |
-| $\Delta z_t$ | The **dissipation signal** — the gap/stretch between observed and equilibrium | vector, dimension $d$ |
-| $\epsilon_t$, $\eta_t$ | Small random "noise" terms — things the model can't predict | random vectors |
-| $V(\cdot)$ | A **potential function** — think "the energy stored in a stretched rubber band" | scalar function |
-| $\lambda$ | A tuning number controlling how strongly the "band" pulls back to resting position | positive number |
-| $f_\phi(X_t)$ | A small neural network that turns raw data into a "push" — how hard news is stretching the band right now | vector, dimension $d$ |
-| $\hat{Y}_t$ | The model's final prediction (e.g., expected return) | scalar or vector |
-| $g_\psi(\cdot)$, $\text{MLP}_\psi(\cdot)$ | Small neural networks (Multi-Layer Perceptrons) that turn internal signals into final predictions | function |
-| $r_{t:t+h}$ | The market's actual return from time $t$ to $t+h$ | scalar |
-| $\mathcal{L}$ | **Loss** — a number the model tries to make as small as possible during training | scalar |
-| $\mathbb{R}^d$ | "A list of $d$ real numbers" — just means "a vector with $d$ numbers in it" | notation |
+**EDS asks a different, more specific question**, based on a hypothesis about *why* prices move at all:
 
-**A note on "vectors":** whenever you see something like $z_t^{eq} \in \mathbb{R}^d$, just read it as "$z_t^{eq}$ is a list of $d$ numbers." Neural networks work with lists of numbers (called *embeddings*) instead of raw prices, because lists of numbers can capture more nuanced patterns than a single price can.
+> **Hypothesis:** every asset has a slow-moving, hard-to-observe "fair value" — call it the **equilibrium state**. Left alone, the price would drift smoothly toward this fair value. But news, rumors, and shocks constantly "kick" the price away from equilibrium. The size and freshness of that kick — the **dissipation** — tells you how much correction (reversion, or continuation) is likely to happen next, and in which direction.
+
+In plain terms: think of the equilibrium state like the resting level of water in a bathtub, and news events like someone splashing the water. EDS tries to learn (a) where the resting level is, and (b) how big the current splash is — because a big recent splash means a lot of movement is still "in motion" and hasn't settled yet.
+
+This gives EDS two things a plain price-history model doesn't have:
+
+1. A learned notion of **"fair value"** that isn't just a moving average — it's inferred from the data itself.
+2. A **dissipation signal**, coming from news/text, that measures how far and how violently the price has been pushed away from that fair value.
+
+The final trading signal is built from the *gap* between price and equilibrium, adjusted by how much "settling" energy is still left in the system.
 
 ---
 
-## 2. The core hypothesis, formalized
+## 2. The Cast of Characters (Notation Glossary)
 
-**Hypothesis in words:** markets are usually near some slow-moving "normal" state. News pushes them away from that state. The most profitable moments are *while the market is snapping back*, not while it's calm.
+Read this section once, then use it as a lookup table while reading the rest.
 
-### 2.1 The equilibrium state — the "resting length"
-
-$$
-z_t^{eq} \in \mathbb{R}^d
-$$
-
-**What this means:** at every moment $t$, the model keeps a running, slowly-updating estimate of "what does normal look like right now." It's like a very smooth, very slow-moving average — but computed on a rich internal representation of the market, not just on price.
-
-### 2.2 The observed state — "what's actually happening"
-
-$$
-z_t^{obs} \in \mathbb{R}^d
-$$
-
-**What this means:** this is the model's read on the market's *actual* current condition — which may be far from "normal" right after big news.
-
-### 2.3 The dissipation signal — "how far is the band stretched?"
-
-$$
-\Delta z_t = z_t^{obs} - z_t^{eq}
-$$
-
-**What this means:** simple subtraction. If observed and equilibrium are the same, $\Delta z_t = 0$ — no stretch, calm market. The bigger $\Delta z_t$ is, the more "stretched" the market currently is. This single quantity is the model's main novel ingredient.
-
-### 2.4 How the equilibrium state evolves — "resting length barely changes"
-
-$$
-z_{t+1}^{eq} = z_t^{eq} + \epsilon_t, \qquad \epsilon_t \sim \mathcal{N}(0, \Sigma^{eq})
-$$
-
-**What this means:** the resting state only drifts a tiny, random amount each step ($\epsilon_t$ is small noise drawn from a normal/bell-curve distribution with covariance $\Sigma^{eq}$). This encodes the assumption "equilibrium changes slowly, not every minute."
-
-### 2.5 How the observed state evolves — a "spring with a push"
-
-This is the heart of the model. It's a **differential equation** — a formula for *how fast something is changing right now*, rather than its value directly.
-
-$$
-\frac{dz^{obs}}{dt} = \underbrace{-\lambda \nabla V(z_t^{obs} - z_t^{eq})}_{\text{restoring force}} + \underbrace{f_\phi(X_t)}_{\text{information impulse}} + \underbrace{\eta_t}_{\text{noise}}
-$$
-
-**Reading a differential equation for beginners:** $\dfrac{dz^{obs}}{dt}$ just means "the *rate of change* of $z^{obs}$ right now" — like how fast a car's position changes is its speed. This equation says: *the observed state's rate of change is the sum of three forces.*
-
-- **Restoring force** $-\lambda \nabla V(\cdot)$: this is the rubber band pulling back toward equilibrium. $V$ is the "energy" stored in the stretch (a common, simple choice is $V(\Delta z) = \|\Delta z\|^2$, i.e., "energy grows with the square of the stretch," exactly like a real spring). $\nabla V$ (the *gradient*) just means "the direction that most reduces that energy" — pointing back toward equilibrium. $\lambda$ controls how stiff the spring is.
-- **Information impulse** $f_\phi(X_t)$: a small neural network reads the raw market data and outputs "how hard is news pushing the market away from equilibrium right now."
-- **Noise** $\eta_t$: unpredictable micro-level randomness (bid/ask jitter, small trades, etc.) that no model can capture.
-
-### 2.6 What the model actually predicts
-
-Two equivalent framings are offered:
-
-**Framing A — predict the *rate of dissipation*:**
-
-$$
-\hat{Y}_t = g_\psi\!\left(\frac{d}{dt}\|\Delta z_t\|^2\right)
-$$
-
-**What this means:** $\|\Delta z_t\|^2$ is just "how big is the stretch" (squared length of the vector — the same idea as the Pythagorean theorem, generalized to $d$ dimensions). Taking its rate of change tells you whether the stretch is *growing* (market moving further from normal) or *shrinking* (snapping back). $g_\psi$ is a small neural network that converts that single number into a usable prediction.
-
-**Framing B — predict the return directly from the stretch:**
-
-$$
-\hat{r}_{t:t+h} = \text{MLP}\!\left(\Delta z_t, \frac{d\Delta z_t}{dt}, \dots\right)
-$$
-
-**What this means:** feed the current stretch and how fast it's changing into a small neural network (an MLP is just "several layers of weighted sums + nonlinear squashing functions"), and get out a predicted return over the next $h$ time steps.
+| Symbol | Plain-English meaning |
+| --- | --- |
+| $t$ | A point in time (e.g., a specific day or hour) |
+| $x_t$ | The observed variable at time $t$ — usually price or return |
+| $z_t$ | The **latent equilibrium state** at time $t$: EDS's internal, unobservable estimate of "fair value" |
+| $e_t$ | The **deviation**: how far the observed price is from the equilibrium ($e_t = x_t - z_t$) |
+| $n_t$ | Raw news/text data available at time $t$ (headlines, articles, filings) |
+| $d_t$ | The **dissipation signal**: a number (or small vector) summarizing how much "shock energy" news has injected into the system recently |
+| $f_\theta(\cdot)$ | A neural network (parameters $\theta$) that describes how the equilibrium state drifts on its own, with no news |
+| $g_\phi(\cdot)$ | A neural network (parameters $\phi$) that turns raw news into the dissipation signal $d_t$ |
+| $h_\psi(\cdot)$ | A neural network (parameters $\psi$) that turns news embeddings *and* the current state into a forcing push on the equilibrium |
+| $D_t$ | **Dissipation energy**: a single non-negative number measuring the "size" of the current shock, $D_t = \lVert d_t \rVert^2$ |
+| $\frac{dz}{dt}$ | "The rate of change of $z$ over time" — how fast the equilibrium state is drifting, at this instant |
+| $\mathcal{N}(\mu, \sigma^2)$ | A normal (bell-curve) distribution with mean $\mu$ and variance $\sigma^2$ |
+| $\mathbb{E}[\cdot]$ | "The expected value of" — roughly, the average outcome if you repeated the experiment many times |
+| $\mathcal{L}$ | A **loss function**: a number the model tries to make as small as possible during training |
+| $\hat{y}$ | A model's prediction (the "hat" means "estimated") |
+| $\sigma(\cdot)$ | The sigmoid function, $\sigma(u) = \frac{1}{1+e^{-u}}$, which squashes any real number into the range $(0,1)$ — used to turn a raw score into a probability |
 
 ---
 
-## 3. Where the novelty actually comes from
+## 3. Step 1 — Turning Prices into Something a Model Can Learn From
 
-It helps to separate four different things a "new model" could mean — EDS only claims novelty in two of them.
+### 3.1 Returns, not raw prices
 
-| Question | Answer for EDS |
-|---|---|
-| **New neural network architecture?** | No. It reuses a standard tool (a Neural ODE — see box below) as plumbing, not as the contribution. |
-| **New training objective (loss)?** | **Yes** — see Section 4. |
-| **New inductive bias** (built-in assumption)? | **Yes, and this is the main contribution** — see below. |
-| **New way of representing the market?** | **Yes** — the market is represented as a small dynamical system, not a snapshot of features. |
-
-> **Box: what's a "Neural ODE"?** A normal neural network takes an input and produces an output in one step. A Neural ODE instead learns the *rate of change* (like Section 2.5) and then uses a numerical solver to "integrate forward in time" to see where the system ends up. It's the natural tool whenever you want to model something evolving continuously, like a spring, a temperature, or — here — a market state.
-
-**The inductive bias, in one sentence:**
-> *Markets have a slow-changing "normal" and fast, energy-releasing reactions to news — and the reaction dynamics themselves are the signal.*
-
-This is different from giving a Transformer or an LSTM a pile of price/volume features and asking it to "figure out the pattern" — EDS instead *tells* the model the shape of the pattern (spring-like restoring force + external push) and only asks it to learn the details (how stiff is the spring, how big is the push).
-
-**The new market representation** — instead of a flat feature vector, the market state is:
+Raw prices (e.g., "$187.42") are hard for models to learn from because their scale drifts over years. Instead we use **returns**:
 
 $$
-M_t = \{ z_t^{\mathrm{obs}},\ z_t^{\mathrm{eq}},\ \dot{z}_t^{\mathrm{obs}},\ \Delta z_t \}
+r_t = \frac{C_t}{C_{t-1}} - 1,
 $$
 
-**What this means:** rather than one snapshot, the model keeps track of *position* ($z^{obs}$), *reference point* ($z^{eq}$), *velocity* ($\dot z^{obs}$, i.e. rate of change), and *displacement* ($\Delta z_t$) — the same set of quantities you'd track for a physical object on a spring.
+where $C_t$ is the closing price on day $t$. This says: *"what fraction did the price change by, from yesterday to today?"* A return of $0.02$ means "up 2%."
+
+### 3.2 The label we're trying to predict
+
+EDS predicts the **direction** of the next return:
+
+$$
+y_{t+1} = \mathbf{1}\{ r_{t+1} > 0 \},
+$$
+
+where $\mathbf{1}\{\cdot\}$ is 1 if the condition in the braces is true, and 0 otherwise. In words: *"did the price go up tomorrow, yes or no?"*
+
+### 3.3 News as data
+
+Alongside price data, EDS consumes a stream of news/text $n_t$ (headlines, articles) tagged to the relevant asset at time $t$. This is converted into a numeric **embedding** — a fixed-length vector of numbers that captures the "meaning" of the text — using a standard pretrained text-embedding model. Call this embedding $v_t \in \mathbb{R}^k$. This step is a preprocessing step and is not itself novel; the novel part is what EDS *does* with $v_t$ next (Section 5).
 
 ---
 
-## 4. The loss function — how the model is actually trained
+## 4. Step 2 — The Core Idea: Equilibrium as a Differential Equation
 
-A **loss function** is just a number that measures "how wrong the model currently is." Training = adjusting the model's internal numbers (weights) to make this number smaller. EDS uses three losses added together:
+### 4.1 What is a "differential equation," in plain terms?
 
-$$
-\mathcal{L} = \mathcal{L}_{\text{prediction}} + \lambda_1 \mathcal{L}_{\text{dynamics}} + \lambda_2 \mathcal{L}_{\text{stability}}
-$$
+A differential equation just describes **how fast something changes**, rather than what it equals directly. For example, "a car accelerates at 2 meters per second, per second" is a differential-equation-style statement — it tells you the *rate of change* of speed, not the speed itself. You then have to "integrate" (add up all those small changes over time) to find out where the car actually ends up.
 
-**What this means:** the total loss is a weighted sum of three separate "complaints" the model has to satisfy at once. $\lambda_1$ and $\lambda_2$ are dials that control how much each complaint matters relative to the others.
-
-### 4.1 Prediction loss — "did you predict the return correctly?"
-
-Standard mean-squared error between predicted and actual returns. This is the only piece a normal forecasting model would have.
-
-### 4.2 Dynamics loss — "did you obey the spring equation?"
+EDS models the equilibrium state $z_t$ the same way — not by predicting its value directly, but by predicting how it *drifts*:
 
 $$
-\mathcal{L}_{\text{dynamics}} = \left\| \frac{dz^{obs}}{dt} - \Big(-\lambda \nabla V(z_t^{obs}-z_t^{eq}) + f_\phi(X_t)\Big) \right\|^2
+\frac{dz_t}{dt} = f_\theta(z_t) + h_\psi(z_t, v_t).
 $$
 
-**What this means:** this penalizes the model whenever its *actual* internal rate-of-change disagrees with what the spring-plus-push equation from Section 2.5 predicts it should be. This is called a **physics-informed loss** — it forces the internal machinery to actually behave like the physical story we told it to, rather than becoming an uninterpretable black box that happens to also predict returns.
+Let's unpack the right-hand side term by term:
 
-### 4.3 Stability loss — "don't let 'normal' jump around"
+- $f_\theta(z_t)$ — the **self-drift** term. Left undisturbed, this pulls $z_t$ toward a stable resting point, the same way a ball in a bowl rolls toward the bottom. $f_\theta$ is a small neural network that learns the shape of that "bowl" directly from data — nobody tells it in advance what the fair value should be.
+- $h_\psi(z_t, v_t)$ — the **news-forcing** term. This is the "splash" — it pushes $z_t$ away from its resting point whenever news comes in that's surprising or significant. $h_\psi$ is a second small neural network that decides *how big and in what direction* the push should be, based on what the news embedding $v_t$ says and where the state currently is.
+
+If there were never any news, $h_\psi$ would contribute (approximately) zero, and $z_t$ would just glide toward the bottom of its bowl. Because news arrives continuously, $z_t$ is always being pushed around a bit before it can fully settle — which is exactly the "non-equilibrium" behavior real markets show.
+
+### 4.2 Solving the equation: the Neural ODE
+
+We can't write $f_\theta$ and $h_\psi$ down as neat formulas — they're neural networks with thousands of parameters, learned from data. But we can still compute $z_t$ at any future time by **numerically integrating** the equation forward, one small time-step $\Delta$ at a time. This general technique is called a **Neural ODE** (Ordinary Differential Equation solved with a neural network inside it). The simplest way to do this (Euler's method) is:
 
 $$
-\mathcal{L}_{\text{stability}} = \left\| z_{t+1}^{eq} - z_t^{eq} \right\|^2
+z_{t+\Delta} \approx z_t + \Delta \cdot \Big[ f_\theta(z_t) + h_\psi(z_t, v_t) \Big].
 $$
 
-**What this means:** penalizes big jumps in the equilibrium state from one step to the next, keeping it "slow-moving" as required by the hypothesis (Section 2.4).
+In words: *"the equilibrium state a little later is roughly the state now, plus a small step in the direction the equation says it's moving."* Real implementations use more accurate solvers (e.g., Runge-Kutta / `dopri5`), but the intuition is identical — just with smaller, smarter steps.
+
+### 4.3 Getting from price to the starting point $z_0$
+
+Before we can integrate forward, we need a starting value $z_0$. This comes from an **encoder** network that looks at a recent window of prices and returns:
+
+$$
+z_0 = \mu_\phi(x_{t-L:t}), \qquad L = \text{window length (e.g., 20 days)}.
+$$
+
+In words: *"look at the last $L$ days of price data and produce a best guess for today's fair value."* This is analogous to how a moving average summarizes recent prices — except the encoder is a neural network that can learn a much richer summary than a simple average.
 
 ---
 
-## 5. The full pipeline, step by step
+## 5. Step 3 — The Dissipation Signal: Turning News Into a Number
 
-This is the order of operations a real implementation would follow, start to finish.
+This is the heart of what makes EDS different from a generic Neural ODE forecaster.
 
-### Step 1 — Encode raw data
+### 5.1 From news embedding to "shock vector"
 
-$$
-X_t \xrightarrow{E_\theta} h_t, \qquad h_t \in \mathbb{R}^d
-$$
-
-**What this means:** raw numbers (price, volume, order-book snapshots for, say, the last 100 minutes) get passed through an encoder network $E_\theta$ that compresses them into a $d$-dimensional embedding $h_t$ — a denser, more useful internal representation.
-
-### Step 2 — Infer the equilibrium state
+Recall $v_t$ is the numeric embedding of the news at time $t$. We pass it (together with the current state) through the forcing network:
 
 $$
-z_t^{eq} = \text{EMA}(h_t)
+d_t = h_\psi(z_t, v_t) \in \mathbb{R}^m.
 $$
 
-**What this means:** EMA = **Exponential Moving Average**, a weighted average that gives more importance to recent values but never forgets the past entirely. Here it's applied to the embeddings $h_t$, not raw prices, so it can filter out short-term noise while adapting slowly. In practice this could be a small learnable network rather than a fixed formula.
+$d_t$ is a small vector that represents *"the direction and strength of the push that news is currently applying to the equilibrium state."*
 
-### Step 3 — Evolve the observed state (the Neural ODE)
+### 5.2 Dissipation energy — a single number you can actually look at
 
-Start the observed state at the embedding: $z_{t_0}^{obs} = h_{t_0}$. Then integrate the spring equation forward:
-
-$$
-\frac{dz^{obs}}{dt} = -\lambda \nabla V(z^{obs}-z^{eq}) + f_\phi(X_t)
-$$
-
-A common simplification is a **quadratic potential**, which produces a **linear** restoring force — exactly the equation for a damped harmonic oscillator (a mass on a spring with friction), one of the most well-studied systems in physics:
+A vector is hard to interpret at a glance, so EDS also defines a scalar (single-number) summary called the **dissipation energy**:
 
 $$
-\nabla V(z^{obs}-z^{eq}) = z^{obs} - z^{eq}
+D_t = \lVert d_t \rVert^2 = \sum_{i=1}^{m} d_{t,i}^2 .
 $$
 
-### Step 4 — Compute the dissipation signal after a short time step
+This is just "add up the squares of every entry in the vector." The physical analogy: if $d_t$ is like a force, $D_t$ is like the energy that force is currently injecting into the system. A big $D_t$ means "a lot of shock is happening right now"; a small $D_t$ means "things are calm, prices are close to drifting on their own."
 
-Solve the equation above forward by a short horizon $\Delta t$ (e.g., 5 time steps) to get $z_{t+\Delta t}^{obs}$, then compute how fast the "stretch energy" is changing:
+**Why does this matter for predicting returns?** The hypothesis is: *when $D_t$ is high, the system is "away from rest" and has to move (settle) at some point soon — so the near-future return is more predictable than during calm periods.* When $D_t$ is near zero, the market is close to its own equilibrium and near-term moves are closer to noise.
 
-$$
-\Delta E_t = \frac{\|z_{t+\Delta t}^{obs}-z_{t+\Delta t}^{eq}\|^2 - \|z_t^{obs}-z_t^{eq}\|^2}{\Delta t}
-$$
+### 5.3 The deviation — how far price has strayed from fair value
 
-**What this means:** this is literally "(energy now) minus (energy a moment ago), divided by the time elapsed" — the definition of a *rate*. If $\Delta E_t > 0$, the market is stretching further from normal (accelerating reaction). If $\Delta E_t < 0$, it's snapping back (dissipating).
-
-### Step 5 — Make the final prediction
+We also track the plain gap between the observed price/return and the model's internal fair value:
 
 $$
-\hat{Y}_t = \text{MLP}_\psi\left(\Delta E_t,\ z_t^{obs},\ z_t^{eq},\ \Delta z_t\right)
+e_t = x_t - z_t .
 $$
 
-which can output one or several targets at once:
-
-$$
-\begin{bmatrix} \mathbb{E}[r_{t:t+h}] \\ P(r_{t:t+h}>0) \\ \sigma_{t:t+h} \end{bmatrix}
-$$
-
-**What this means:** the model can simultaneously output (1) the *expected* return, (2) the *probability* the return is positive, and (3) the expected *volatility* (riskiness) — all from the same dissipation-based internal state.
-
-### Step 6 — Turn the prediction into a trading position
-
-A simple **Kelly Criterion** sizing rule converts the prediction into a portfolio weight (how much of your capital to allocate):
-
-$$
-w_t = \frac{\mathbb{E}[r_{t:t+h}]}{\sigma_{t:t+h}^2}
-$$
-
-**What this means:** bet more when expected return is high *relative to* risk, and less when risk is high. This weight is then passed through additional risk constraints before actual trades are placed — the model never sizes trades on raw conviction alone.
+A positive $e_t$ means "the market price is trading above what EDS thinks is fair" (potentially overextended); a negative $e_t$ means the opposite.
 
 ---
 
-## 6. A tiny worked numeric example
+## 6. Step 4 — From Signals to a Prediction (The Alpha Head)
 
-To make Sections 2–5 concrete, here's a toy example using just **1-dimensional** states (i.e., $d=1$, a single number instead of a vector) — real models use $d$ in the dozens or hundreds, but the arithmetic is identical.
-
-Suppose at time $t$:
-- Equilibrium state: $z_t^{eq} = 10.0$
-- Observed state: $z_t^{obs} = 10.6$
-- So the stretch is: $\Delta z_t = z_t^{obs} - z_t^{eq} = 0.6$
-
-Using the simple quadratic potential $V(\Delta z) = \Delta z^2$, the "stretch energy" right now is:
+EDS doesn't hand $z_t$, $e_t$, and $D_t$ directly to a trader — it combines them through one more small neural network, the **alpha head** $a_\omega$, which produces the final probability:
 
 $$
-\|\Delta z_t\|^2 = 0.6^2 = 0.36
+p_t = \sigma\Big( a_\omega\big(z_t,\ e_t,\ D_t\big) \Big).
 $$
 
-Say the restoring-force stiffness is $\lambda = 0.5$, and the news-impulse network currently outputs $f_\phi(X_t) = 0.1$ (a small extra push away from equilibrium). Then the rate of change of the observed state is:
+Walking through this:
+
+1. $a_\omega(z_t, e_t, D_t)$ takes the three signals and combines them into one raw score (a real number, could be positive or negative, no fixed range).
+2. $\sigma(\cdot)$, the sigmoid function, squashes that raw score into a probability between 0 and 1.
+3. $p_t$ is interpreted as *"the model's estimated probability that tomorrow's return is positive."*
+
+A natural, interpretable special case (useful for intuition, and a reasonable first baseline before training the full $a_\omega$ network) is:
 
 $$
-\frac{dz^{obs}}{dt} = -\lambda(z^{obs}-z^{eq}) + f_\phi(X_t) = -0.5(0.6) + 0.1 = -0.2
+p_t \approx \sigma\Big( -\beta_1 \, e_t \;+\; \beta_2 \, D_t \cdot \text{sign}(-e_t) \Big),
 $$
 
-**Reading this:** the observed state is currently moving *toward* equilibrium at a rate of $0.2$ per unit time (the negative sign means "shrinking the gap") — even though a small news push is still nudging it the other way. The restoring force is winning. If we take one small time step, say $\Delta t = 1$:
+which encodes two plain-language ideas at once:
 
-$$
-z_{t+1}^{obs} \approx z_t^{obs} + \frac{dz^{obs}}{dt}\cdot \Delta t = 10.6 - 0.2 = 10.4
-$$
+- **Mean reversion:** if price is above fair value ($e_t > 0$), lean toward predicting a *down* move, and vice versa — this is the $-\beta_1 e_t$ term.
+- **Dissipation-scaled conviction:** the higher the current dissipation energy $D_t$, the *more strongly* we lean on that reversion signal, because a large recent shock means more "unsettled" movement is still working through the system.
 
-New stretch: $\Delta z_{t+1} = 10.4 - 10.0 = 0.4$, so energy is now $0.4^2 = 0.16$. The rate of dissipation is:
-
-$$
-\Delta E_t = \frac{0.16 - 0.36}{1} = -0.20
-$$
-
-**Reading this:** energy dropped — the "band" is snapping back, which under the model's hypothesis is exactly the moment it expects to have predictive information about the next price move.
+The actual $a_\omega$ used in the full model is a small multi-layer neural network rather than this fixed formula, so it can learn nonlinear combinations and interactions the simple formula above can't capture — but this expression is a good mental model for *why* the three inputs matter.
 
 ---
 
-## 7. Evaluating whether it actually works (in plain language)
+## 7. Step 5 — How the Whole Thing Is Trained
 
-A physics-flavored story is not evidence by itself. The evaluation plan is designed to test it rigorously against normal baselines (Linear Regression, XGBoost, LSTM, Transformer — all fed the *same* raw data).
+Training means: adjust all the neural network parameters ($\theta$, $\phi$, $\psi$, $\omega$) so that the model's outputs match reality as closely as possible, across many historical examples. EDS is trained on two goals simultaneously:
 
-| Metric | Plain-English meaning |
-|---|---|
-| **Information Coefficient (IC)** | The Spearman rank correlation between the model's predicted returns and what actually happened. Roughly: "if I sort assets by predicted return, do they come out in roughly the same order as their actual return?" Ranges from $-1$ (backwards) to $1$ (perfect). |
-| **IC decay** | How fast the IC weakens the further out you try to predict. A signal that's great for 1 minute but useless for 1 hour has fast IC decay. |
-| **Sharpe Ratio** | Return earned per unit of risk taken, *after* subtracting trading costs. Higher is better; it's the standard way to compare strategies that take different amounts of risk. |
-| **Regime sensitivity** | Does the model do especially well specifically during high-volatility, "stretched" periods? If the hypothesis is right, it should — this is the most direct test of the core idea. |
-| **Diebold-Mariano test** | A statistical test asking: "is Model A actually more accurate than Model B, or could the difference just be luck?" |
-| **Permutation test on Sharpe Ratio** | Shuffles the data many times and recomputes performance, to check whether the strategy's edge could have appeared by chance. |
+### 7.1 Goal 1 — Reconstruction (make sure $z_t$ is meaningful)
 
-**Validation method:** *Purged Walk-Forward Validation* — the model is only ever tested on data that comes chronologically *after* the data it was trained on (never mixing past and future), with a gap ("purge") around the split to prevent subtle leakage from overlapping windows.
+We don't want $z_t$ to be an arbitrary internal number that happens to help predictions by accident (that could just be memorizing noise). We want it to actually behave like a "fair value" for the price series. So we ask a decoder network $\text{dec}_\psi$ to reconstruct the actual observed price from $z_t$, and penalize it when it can't:
 
----
+$$
+\mathcal{L}_{\text{recon}} = \frac{1}{N}\sum_{t=1}^{N} \big( x_t - \text{dec}_\psi(z_t) \big)^2 .
+$$
 
-## 8. Recap — why this counts as a real research question
+This is ordinary **mean squared error**: for each time step, take the difference between the real value and the model's reconstruction, square it (so positive and negative errors both count, and big errors are punished more), and average over all $N$ examples.
 
-The claim is **not** "a new neural network was invented." The claim is:
+### 7.2 Goal 2 — Direction prediction (the actual trading task)
 
-> *Markets behave like non-equilibrium dynamical systems — a slow-moving equilibrium plus fast, information-driven, energy-dissipating reactions — and explicitly modeling that structure (rather than treating market data as a flat feature vector) improves out-of-sample return prediction versus standard baselines.*
+$$
+\mathcal{L}_{\text{pred}} = -\frac{1}{N}\sum_{t=1}^{N} \Big[ y_{t+1}\log p_t + (1-y_{t+1})\log(1-p_t) \Big].
+$$
 
-That's a falsifiable, testable claim, and the entire point of Sections 6 and 7 is that the evaluation plan can actually prove it *wrong* if the hypothesis is bad — which is what makes it science rather than a plausible-sounding story.
+This is **binary cross-entropy**, the standard loss for "predict a yes/no outcome." In plain terms: it heavily penalizes the model for being confidently wrong (e.g., predicting $p_t = 0.95$ when the answer was actually "down"), and rewards it for being confidently right.
 
----
+### 7.3 Combining the two goals
 
-## 9. Mini glossary (quant + math terms used above)
+$$
+\mathcal{L} = \mathcal{L}_{\text{recon}} + \lambda \, \mathcal{L}_{\text{pred}},
+$$
 
-| Term | Meaning |
-|---|---|
-| **Latent state** | An internal, learned representation that isn't directly observed in the raw data — the model invents it to make its job easier. |
-| **Embedding** | A list of numbers a neural network uses to represent something (a word, an image patch, or here, a slice of market data). |
-| **Gradient** ($\nabla$) | The direction of steepest increase of a function; $-\nabla V$ points toward the *decrease* — i.e., "downhill." |
-| **Differential equation** | An equation describing a *rate of change* rather than a value directly; solving it tells you the value over time. |
-| **Neural ODE** | A model where a neural network defines the rate-of-change function of a differential equation, solved with a numerical integrator. |
-| **MLP (Multi-Layer Perceptron)** | The simplest kind of neural network: alternating weighted sums and nonlinear "squashing" functions. |
-| **Exponential Moving Average (EMA)** | A running average that weights recent data more heavily but never fully forgets older data. |
-| **Mean Squared Error (MSE)** | Average of the squared differences between predictions and actual values — a standard way to measure prediction error. |
-| **Spearman rank correlation** | Correlation computed on the *rankings* of two variables rather than their raw values — robust to outliers and nonlinearity. |
-| **Sharpe Ratio** | (Average return − risk-free rate) ÷ (standard deviation of returns) — return per unit of risk. |
-| **Walk-forward validation** | Testing a model only on data chronologically after its training data, repeated across multiple rolling windows. |
-| **Kelly Criterion** | A bet-sizing formula that scales position size with expected edge and inversely with risk (variance). |
+where $\lambda$ is a hand-set weight (a hyperparameter) controlling how much we prioritize prediction accuracy versus keeping $z_t$ faithful to the real price series. Training proceeds by standard gradient descent (e.g., the Adam optimizer): repeatedly nudge $\theta, \phi, \psi, \omega$ in the direction that shrinks $\mathcal{L}$, using many small batches of historical data.
+
+**Important nuance:** because $z_t$ is produced by integrating an ODE forward through time, gradients flow back not just through one time step but through the *entire integration path* — this is what "Neural ODE" training means in practice, and it's typically done efficiently with the *adjoint method*, which avoids having to store every intermediate integration step in memory.
 
 ---
 
-## 10. Notes on scope
+## 8. Putting It All Together: The Full Pipeline
 
-This document explains the **mathematical structure** of EDS. It intentionally does not include: hyperparameter values for a specific implementation, transaction cost modeling, execution/slippage assumptions, or live portfolio risk controls — those belong in an implementation-specific document once the research prototype above is validated.
+$$
+\text{price history} \;\rightarrow\; \text{encoder} \;\rightarrow\; z_0
+$$
+$$
+\text{news embeddings} \;\rightarrow\; h_\psi \;\rightarrow\; d_t,\ D_t
+$$
+$$
+z_0,\ f_\theta,\ h_\psi \;\xrightarrow{\text{Neural ODE integration}}\; z_t \text{ for each future } t
+$$
+$$
+(z_t,\ e_t,\ D_t) \;\rightarrow\; a_\omega \;\rightarrow\; p_t \;\rightarrow\; \text{trade / no-trade decision}
+$$
+
+| Stage | What goes in | What comes out | Plain-English role |
+| --- | --- | --- | --- |
+| Encoder | recent price window | $z_0$ | "Best guess at today's fair value" |
+| News forcing network ($h_\psi$) | news embedding + state | $d_t$, $D_t$ | "How big is the current shock, and which way is it pushing?" |
+| Self-drift network ($f_\theta$) | current state | drift direction | "Where would price settle if left alone?" |
+| Neural ODE integrator | $z_0$, $f_\theta$, $h_\psi$ | $z_t$ for future $t$ | "Simulate the equilibrium state forward in time" |
+| Decoder | $z_t$ | reconstructed price | "Sanity check: does $z_t$ still look like a real price?" |
+| Alpha head ($a_\omega$) | $z_t$, $e_t$, $D_t$ | $p_t$ | "Turn everything into a single up/down probability" |
+
+---
+
+## 9. Turning a Probability Into a Trading Decision
+
+As in most probability-based systems, EDS avoids forcing a decision when it isn't confident. Using a confidence threshold $\tau$ (e.g., $\tau = 0.6$):
+
+$$
+\hat{y} =
+\begin{cases}
+\text{long (predict up)}, & p_t \ge \tau \\
+\text{short (predict down)}, & p_t \le 1-\tau \\
+\text{abstain (no trade)}, & 1-\tau < p_t < \tau
+\end{cases}
+$$
+
+In words: *"only take a position when the model is meaningfully more confident than a coin flip; otherwise, sit out."* This trades off **coverage** (how often you trade) against **selective accuracy** (how often you're right, on the trades you do make) — a model that only trades on its 5 most confident days a year might have very high accuracy but very little practical use, so both numbers should always be reported together, not just one.
+
+---
+
+## 10. Why This Is a *Novel* Hypothesis, Not Just Another Architecture
+
+- **The inductive bias comes from a stated, falsifiable belief about markets** — that price behavior is best understood as a slow equilibrium process periodically kicked off-course by external information — rather than "let's see what a big enough neural net finds."
+- **The equilibrium state $z_t$ is learned, not assumed.** It isn't a moving average or a hand-picked "fair value" formula; the self-drift network $f_\theta$ discovers the shape of the "bowl" from the data itself.
+- **News enters the model physically, not just as another feature column.** Instead of concatenating a sentiment score onto a feature vector, news is treated as a *forcing term* that perturbs a dynamical system — a fundamentally different mechanism than typical feature-based sentiment models.
+- **Dissipation energy $D_t$ is a genuinely new, interpretable quantity.** It isn't simply "how strong was the news" (a text-based measure) or "how much did price move" (an already-realized outcome) — it's the model's own internal estimate of how much unresolved disequilibrium currently exists, computed *before* the resulting price move has fully played out.
+- **The model is inspectable.** You can plot $z_t$ against the real price to sanity-check the learned "fair value," plot $D_t$ over time to see when the model thinks the market is most unsettled, and directly examine cases where large $D_t$ did or didn't precede a big move.
+
+---
+
+## 11. Honest Limitations
+
+- **Identifiability:** in principle, many different combinations of $f_\theta$ and $h_\psi$ could produce the same observed $z_t$ path. Some regularization (e.g., encouraging $f_\theta$ to represent a *smooth, simple* resting tendency) is needed to keep the split meaningful rather than arbitrary.
+- **Text embeddings are noisy.** Not all news that "sounds important" actually moves markets, and not all market-moving events are reported as news at the time.
+- **A decreasing training loss is not the same as real predictive skill.** As with any model, EDS must be evaluated out-of-sample, on data and assets it was not trained on, with realistic transaction costs — a backtest that ignores costs and slippage can look far better than a live strategy ever would.
+- **This is a research prototype.** It has no portfolio-level position sizing, no risk controls, and no execution model — those are separate, necessary layers on top of the probability $p_t$ before anything resembling live trading could be considered.
+
+---
+
+## 12. Quick Reference: All Formulas in One Place
+
+| # | Formula | Meaning in one line |
+| --- | --- | --- |
+| 1 | $r_t = \frac{C_t}{C_{t-1}} - 1$ | Daily return |
+| 2 | $y_{t+1} = \mathbf{1}\{r_{t+1} > 0\}$ | Up/down label |
+| 3 | $\frac{dz_t}{dt} = f_\theta(z_t) + h_\psi(z_t, v_t)$ | Equilibrium dynamics: self-drift + news forcing |
+| 4 | $z_{t+\Delta} \approx z_t + \Delta[f_\theta(z_t) + h_\psi(z_t, v_t)]$ | One numerical integration step |
+| 5 | $z_0 = \mu_\phi(x_{t-L:t})$ | Encoder: recent prices → starting equilibrium estimate |
+| 6 | $d_t = h_\psi(z_t, v_t)$ | Dissipation (shock) vector |
+| 7 | $D_t = \lVert d_t \rVert^2$ | Dissipation energy (scalar) |
+| 8 | $e_t = x_t - z_t$ | Deviation from equilibrium |
+| 9 | $p_t = \sigma(a_\omega(z_t, e_t, D_t))$ | Final up/down probability |
+| 10 | $\mathcal{L}_{\text{recon}} = \frac{1}{N}\sum (x_t - \text{dec}_\psi(z_t))^2$ | Reconstruction loss |
+| 11 | $\mathcal{L}_{\text{pred}} = -\frac{1}{N}\sum[y\log p + (1-y)\log(1-p)]$ | Prediction loss (cross-entropy) |
+| 12 | $\mathcal{L} = \mathcal{L}_{\text{recon}} + \lambda\mathcal{L}_{\text{pred}}$ | Combined training objective |
+
+---
+
+## References
+
+1. Chen, T. Q. et al., [Neural Ordinary Differential Equations](https://arxiv.org/abs/1806.07366).
+2. Rubanova, Y. et al., [Latent ODEs for Irregularly-Sampled Time Series](https://arxiv.org/abs/1907.03907).
+3. Devlin, J. et al., [BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding](https://arxiv.org/abs/1810.04805) (representative text-embedding approach).
+4. Niculescu-Mizil, A. and Caruana, R., [Predicting Good Probabilities with Supervised Learning](https://dl.acm.org/doi/10.1145/1102351.1102430).
